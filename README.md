@@ -38,7 +38,8 @@ A shell inside Android/chroot/proot is not the target and must not be reported a
 - [ ] Extended inventory: host-side boot image format, DT compatibles, module load order and demonstrated USB gadget capabilities.
 - [ ] Locate and audit rodin/MT6899 kernel sources and licensing; identify missing components.
 - [ ] Confirm recovery path and privately preserve matching restore artifacts.
-- [ ] Reproducible minimal initramfs build and boot image inspection, without flashing.
+- [x] Host-only minimal ARM64 initramfs build and vendor_boot v4 inspection, with tests. See [experiment 001](docs/host-bringup.md).
+- [ ] Inspect boot/init_boot composition and validate an observable first-boot path.
 - [ ] First non-Android initramfs boot and observable console.
 - [ ] Rootfs + USB networking.
 - [ ] Experimental postmarketOS packaging.
