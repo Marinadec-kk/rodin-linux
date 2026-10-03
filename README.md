@@ -39,7 +39,8 @@ A shell inside Android/chroot/proot is not the target and must not be reported a
 - [ ] Locate and audit rodin/MT6899 kernel sources and licensing; identify missing components.
 - [ ] Confirm recovery path and privately preserve matching restore artifacts.
 - [x] Host-only minimal ARM64 initramfs build and vendor_boot v4 inspection, with tests. See [experiment 001](docs/host-bringup.md).
-- [ ] Inspect boot/init_boot composition and validate an observable first-boot path.
+- [x] Extract and inspect boot/init_boot/vendor_boot from the pinned full OTA; document USB driver prerequisites. See [experiment 002](docs/boot-layout.md).
+- [ ] Validate an observable non-Android first-boot path; USB ACM is only a candidate.
 - [ ] First non-Android initramfs boot and observable console.
 - [ ] Rootfs + USB networking.
 - [ ] Experimental postmarketOS packaging.
