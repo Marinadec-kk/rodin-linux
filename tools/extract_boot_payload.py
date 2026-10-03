@@ -15,7 +15,8 @@ import struct
 import zipfile
 
 ROM_SHA256 = "51a24fb889c286c27df892fcbee1f9977f9d32a76bbd1316900f3e90aa8a52e8"
-ALLOWED = {"boot", "init_boot", "vendor_boot", "vendor_dlkm", "system_dlkm"}
+ALLOWED = {"boot", "init_boot", "vendor_boot", "vendor_dlkm", "system_dlkm",
+           "vbmeta", "vbmeta_system", "vbmeta_vendor"}
 MAX_PARTITION = 256 * 1024 * 1024
 ROOT = Path(__file__).resolve().parents[1]
 

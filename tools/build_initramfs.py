@@ -82,7 +82,7 @@ def newc(entries):
     return bytes(out)
 
 
-def build(binary, init):
+def build(binary, init, extra_entries=()):
     entries = []
     for name in ("bin", "sbin", "dev", "dev/pts", "proc", "sys", "run", "root"):
         entries.append((name, stat.S_IFDIR | (0o700 if name == "root" else 0o755), b"", 0, 0))
@@ -91,6 +91,10 @@ def build(binary, init):
                 ("init", stat.S_IFREG | 0o755, init, 0, 0)]
     for name, major, minor in (("console", 5, 1), ("null", 1, 3), ("tty", 5, 0), ("kmsg", 1, 11)):
         entries.append((f"dev/{name}", stat.S_IFCHR | 0o600, b"", major, minor))
+    entries.extend(extra_entries)
+    names = [entry[0] for entry in entries]
+    if len(set(names)) != len(names):
+        raise ValueError("Duplicate initramfs entry")
     cpio = newc(entries)
     compressed = io.BytesIO()
     with gzip.GzipFile(filename="", mode="wb", fileobj=compressed, mtime=0, compresslevel=9) as f:

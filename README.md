@@ -40,7 +40,8 @@ A shell inside Android/chroot/proot is not the target and must not be reported a
 - [ ] Confirm recovery path and privately preserve matching restore artifacts.
 - [x] Host-only minimal ARM64 initramfs build and vendor_boot v4 inspection, with tests. See [experiment 001](docs/host-bringup.md).
 - [x] Extract and inspect boot/init_boot/vendor_boot from the pinned full OTA; document USB driver prerequisites. See [experiment 002](docs/boot-layout.md).
-- [ ] Validate an observable non-Android first-boot path; USB ACM is only a candidate.
+- [x] Build and reproducibly verify a host-only init_boot/USB ACM candidate; run ARM64 BusyBox getty/shell smoke tests. See [experiment 003](docs/usb-acm-candidate.md) and [restore preparation](docs/restore-plan.md).
+- [ ] Validate an observable non-Android first-boot path on hardware; USB ACM is only a candidate.
 - [ ] First non-Android initramfs boot and observable console.
 - [ ] Rootfs + USB networking.
 - [ ] Experimental postmarketOS packaging.

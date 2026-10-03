@@ -1,0 +1,124 @@
+#!/bin/sh
+# Research PID 1, local USB-only unauthenticated shell. Never mount phone storage.
+export PATH=/bin:/sbin
+export HOME=/root
+export TERM=vt100
+umask 077
+
+# Refuse to run this mount/configfs script in an ordinary host/Android shell.
+if [ "$$" -ne 1 ]; then
+    echo "rodin usb-init must be PID 1 in the experimental initramfs" >&2
+    exit 1
+fi
+
+bb() { /bin/busybox "$@"; }
+fatal() {
+    echo "rodin-bringup: fatal: $*" > /dev/console
+    while :; do bb sleep 10; done
+}
+log() {
+    echo "rodin-bringup: $*"
+    echo "rodin-bringup: $*" >> /run/rodin-bringup.log
+    if [ -c /dev/kmsg ]; then echo "<6>rodin-bringup: $*" > /dev/kmsg; fi
+}
+
+# Expose BusyBox applet names inside this writable initramfs, not on phone storage.
+bb --install -s /bin || fatal "BusyBox applet installation"
+
+# proc/sysfs are needed before deriving dynamic tty device numbers.
+bb mount -t proc proc /proc || fatal "proc mount"
+bb mount -t sysfs sysfs /sys || fatal "sysfs mount"
+bb mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run || fatal "run mount"
+bb mount -t devpts -o mode=0620,gid=5 devpts /dev/pts || fatal "devpts mount"
+log "USB ACM candidate; no Android init, no storage mounts"
+
+load_modules() {
+    # Reject wrong ramdisk/module combinations before any module insertion.
+    if ! bb sha256sum -c /etc/rodin/modules.sha256 >> /run/rodin-bringup.log 2>&1; then
+        log "module integrity check failed; USB setup aborted"
+        return 1
+    fi
+    failures=0
+    while read -r module name; do
+        [ -n "$module" ] || continue
+        if [ -d "/sys/module/$name" ]; then continue; fi
+        if bb insmod "$module" >> /run/rodin-bringup.log 2>&1; then
+            log "inserted $name"
+        else
+            log "failed to insert $name"
+            failures=$((failures + 1))
+        fi
+    done < /etc/rodin/modules.load
+    [ "$failures" -eq 0 ] || return 1
+}
+
+usb_console() {
+    bb mkdir -p /run/configfs
+    bb mount -t configfs -o nosuid,nodev,noexec configfs /run/configfs || return 1
+
+    # Wait for driver probing; never assume the Android property is still valid.
+    count=0
+    udc=
+    while [ "$count" -lt 30 ]; do
+        found=0
+        for path in /sys/class/udc/*; do
+            [ -e "$path" ] || continue
+            udc=${path##*/}
+            found=$((found + 1))
+        done
+        if [ "$found" -eq 1 ]; then break; fi
+        if [ "$found" -gt 1 ]; then log "ambiguous UDC selection"; return 1; fi
+        bb sleep 1
+        count=$((count + 1))
+    done
+    [ -n "$udc" ] || { log "no UDC after 30 seconds"; return 1; }
+
+    gadget=/run/configfs/usb_gadget/rodin
+    # Conventional Linux diagnostic gadget IDs, not product IDs for shipping.
+    bb mkdir "$gadget" || return 1
+    echo 0x1d6b > "$gadget/idVendor" || return 1
+    echo 0x0104 > "$gadget/idProduct" || return 1
+    echo 0x0200 > "$gadget/bcdUSB" || return 1
+    echo 0x0001 > "$gadget/bcdDevice" || return 1
+    bb mkdir -p "$gadget/strings/0x409" || return 1
+    echo rodin-bringup > "$gadget/strings/0x409/serialnumber" || return 1
+    echo Linux-research > "$gadget/strings/0x409/manufacturer" || return 1
+    echo Rodin-ACM-console > "$gadget/strings/0x409/product" || return 1
+    bb mkdir -p "$gadget/functions/acm.usb0" "$gadget/configs/c.1/strings/0x409" || return 1
+    echo console > "$gadget/configs/c.1/strings/0x409/configuration" || return 1
+    # MaxPower is mA in configfs. No PD negotiation or charger sysfs writes.
+    echo 100 > "$gadget/configs/c.1/MaxPower" || return 1
+    bb ln -s "$gadget/functions/acm.usb0" "$gadget/configs/c.1/acm.usb0" || return 1
+    echo "$udc" > "$gadget/UDC" || return 1
+    log "ACM bound to $udc"
+
+    count=0
+    while [ ! -r /sys/class/tty/ttyGS0/dev ] && [ "$count" -lt 10 ]; do
+        bb sleep 1
+        count=$((count + 1))
+    done
+    [ -r /sys/class/tty/ttyGS0/dev ] || return 1
+    IFS=: read -r major minor < /sys/class/tty/ttyGS0/dev
+    # Kernel-provided numbers only; do not guess a ttyGS major/minor.
+    case "$major:$minor" in *[!0-9:]*|:*|*:) return 1 ;; esac
+    bb mknod -m 600 /dev/ttyGS0 c "$major" "$minor" || return 1
+    log "ttyGS0 ready; shell has no password (local research only)"
+    while :; do
+        bb setsid /bin/busybox getty -L -n -l /bin/sh 115200 ttyGS0 vt100
+        log "USB shell ended; restarting getty"
+        bb sleep 1
+    done
+}
+
+if load_modules; then
+    usb_console || log "USB console initialization failed"
+else
+    log "module insertion failed; USB setup skipped"
+fi
+
+# Keep PID 1 alive. A kernel console may be inaccessible on this hardware.
+log "falling back to /dev/console; USB is not demonstrated"
+while :; do
+    bb setsid /bin/busybox getty -L -n -l /bin/sh 0 console vt100
+    bb sleep 2
+done
