@@ -34,7 +34,8 @@ A shell inside Android/chroot/proot is not the target and must not be reported a
 ## Milestones
 
 - [x] Create isolated research repository and branch.
-- [ ] Read-only inventory: kernel version/config where accessible, boot image format, DT compatibles, partition layout, modules and USB capabilities.
+- [x] Initial read-only inventory: kernel/config, partition names and vendor module filenames. See [device inventory](docs/device-inventory.md).
+- [ ] Extended inventory: host-side boot image format, DT compatibles, module load order and demonstrated USB gadget capabilities.
 - [ ] Locate and audit rodin/MT6899 kernel sources and licensing; identify missing components.
 - [ ] Confirm recovery path and privately preserve matching restore artifacts.
 - [ ] Reproducible minimal initramfs build and boot image inspection, without flashing.
@@ -60,4 +61,4 @@ Public repository: https://github.com/Marinadec-kk/rodin-linux
 
 Initial research branch: `research/bringup`. The repository preserves the existing AGPL-3.0 license selected by its owner. Any future imported kernel code, device trees or third-party patches retain their original licenses and notices; this repository license does not automatically relicense them.
 
-Git author: `Marinadec-kk`, using the GitHub-provided numeric-ID noreply address. Hardware inventory is pending an authorized ADB connection.
+Git author: `Marinadec-kk`, using the GitHub-provided numeric-ID noreply address. The initial authorized-ADB inventory is documented in [docs/device-inventory.md](docs/device-inventory.md). No experimental Linux image has been booted.
