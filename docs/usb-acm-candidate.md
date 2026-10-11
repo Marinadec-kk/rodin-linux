@@ -31,8 +31,8 @@ Observed local result:
 
 | Artifact | Bytes / SHA-256 |
 | --- | --- |
-| `init_boot-candidate.img` | 8,388,608 bytes; `c432dd4578f08717cf2d34d1fd3b010d889d08e145fcdfa70e6213a16db56f72` |
-| `initramfs.cpio.gz` | 660,358 bytes; `6cea3554fa7377bafbe1f8252b9fa043216c2ee8f0fdf7d0082f28d24310254a` |
+| `init_boot-candidate.img` | 8,388,608 bytes; `4b615d1408d3549aa7828d218a676ac610f31248e7ca28c0fc15e1a9c5ee5f31` |
+| `initramfs.cpio.gz` | 660,437 bytes; `af1dec009149f5f1ec0db3b335c8d6231d20382c961726229e9eff02c548b02f` |
 | embedded OTA kernel config | `9b544345144b5e7d050981905a655308700151693ddf9d10f94eee1eadeb19ec` |
 | selected module load plan | 90 entries; `407f55f7b1812cc1b6c8d40702599c607cf07842530b0505c1b2592add84044c` |
 
@@ -81,8 +81,10 @@ Declared module dependencies do not capture all DT, power-domain, nvmem, firmwar
 
 ## Host validation
 
-- **46 unit tests pass**. Added cases cover exact header-page preservation, raw ramdisk offsets/alignment, wrong image types, oversize payloads, dependency order/deduplication/cycles, missing metadata, unsafe paths, excluded watchdog dependencies and atomic output replacement without following a symlink into restore data.
-- Both PID 1 scripts pass host `sh -n`; the USB init also passes the actual pinned ARM64 BusyBox ash parser.
+- **64 unit tests pass**. Cases cover exact header-page preservation, raw ramdisk offsets/alignment, wrong image types, oversize payloads, dependency order/deduplication/cycles, missing metadata, unsafe paths, excluded watchdog dependencies, atomic output replacement without following a symlink into restore data, the host module inventory tool, generated module-artifact contracts and loader rejection of missing/empty/blank/nameless plans.
+- Both PID 1 scripts pass host `sh -n`; both also pass the actual pinned ARM64 BusyBox ash parser.
+- The USB init refuses a missing, unreadable or empty module plan and counts blank or nameless entries as load failures instead of continuing without modules; the tty device-number parser rejects extra colons.
+- With real local inputs, an ARM64 BusyBox run under QEMU verifies the emitted `modules.sha256` listing against the staged PLATFORM files extracted from the pinned vendor_boot.
 - Two local candidate builds match byte-for-byte, including the manifest and regenerated footer; avbtool verifies the unsigned self-hash.
 - Original boot/init_boot/vendor_boot hashes remain unchanged.
 - The pinned ARM64 BusyBox executes under QEMU user mode. Required applets and the applet installer are present. A non-PID-1 launch refuses before any mounts.
