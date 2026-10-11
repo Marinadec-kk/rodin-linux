@@ -60,6 +60,48 @@ load_modules() {
     [ "$failures" -eq 0 ] || return 1
 }
 
+set_device_role() {
+    udc_device=$(CDPATH= cd -P "/sys/class/udc/$udc/device" && pwd -P) || {
+        log "cannot resolve parent device for UDC $udc"; return 1;
+    }
+    # mtu3 registers the UDC before its role switch; match parents, not names.
+    count=0
+    role_path=
+    while :; do
+        found=0
+        for path in /sys/class/usb_role/*; do
+            [ -d "$path" ] || continue
+            role_device=$(CDPATH= cd -P "$path/device" && pwd -P) || continue
+            [ "$role_device" = "$udc_device" ] || continue
+            role_path=$path/role
+            found=$((found + 1))
+        done
+        if [ "$found" -eq 1 ]; then break; fi
+        if [ "$found" -gt 1 ]; then log "ambiguous USB role switch for $udc"; return 1; fi
+        [ "$count" -lt 30 ] || { log "no USB role switch for $udc after 30 seconds"; return 1; }
+        bb sleep 1
+        count=$((count + 1))
+    done
+    [ -r "$role_path" ] && [ -w "$role_path" ] || {
+        log "USB role attribute unavailable: $role_path"; return 1;
+    }
+    log "requesting device role for $udc via $role_path"
+    echo device > "$role_path" || { log "USB role write failed: $role_path"; return 1; }
+    # mtu3 queues the change; readback is driver state, not proof of enumeration.
+    count=0
+    while :; do
+        IFS= read -r role < "$role_path" || { log "USB role read failed: $role_path"; return 1; }
+        case "$role" in
+            device) log "USB role readback: device ($udc)"; return 0 ;;
+            host|none) ;;
+            *) log "unexpected USB role readback: $role"; return 1 ;;
+        esac
+        [ "$count" -lt 10 ] || { log "USB device role timed out: $role ($udc)"; return 1; }
+        bb sleep 1
+        count=$((count + 1))
+    done
+}
+
 usb_console() {
     bb mkdir -p /run/configfs
     bb mount -t configfs -o nosuid,nodev,noexec configfs /run/configfs || return 1
@@ -97,6 +139,7 @@ usb_console() {
     # MaxPower is mA in configfs. No PD negotiation or charger sysfs writes.
     echo 100 > "$gadget/configs/c.1/MaxPower" || return 1
     bb ln -s "$gadget/functions/acm.usb0" "$gadget/configs/c.1/acm.usb0" || return 1
+    set_device_role || return 1
     echo "$udc" > "$gadget/UDC" || return 1
     log "ACM bound to $udc"
 

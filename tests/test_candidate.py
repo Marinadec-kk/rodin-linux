@@ -215,7 +215,7 @@ class CandidateTests(unittest.TestCase):
         if content is not None:
             plan.write_text(content)
         script = (ROOT / "initramfs/usb-init").read_text()
-        function = script[script.index("load_modules() {"):script.index("\nusb_console()")]
+        function = script[script.index("load_modules() {"):script.index("\nset_device_role()")]
         function = function.replace("/etc/rodin/modules.load", str(plan)).replace("/run/rodin-bringup.log", str(root / "log"))
         function = function.replace("/sys/module/", str(root / "sys/module") + "/")
         (root / "sys/module").mkdir(parents=True)
@@ -235,6 +235,35 @@ class CandidateTests(unittest.TestCase):
                 result = self.module_loader(Path(temp), content)
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("entry has no name", result.stdout)
+
+    def test_usb_role_switch_synthetic_sysfs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            smoke.role_switch_probe(["sh"], Path(temp))
+
+    def test_usb_role_failure_prevents_gadget_binding(self):
+        script = (ROOT / "initramfs/usb-init").read_text()
+        function = script[script.index("usb_console() {"):script.index('\n    log "ACM bound to $udc"')]
+        function += '\n}\nusb_console'
+        for status in (0, 1):
+            with self.subTest(role_status=status), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                udcs = root / "udc"
+                udcs.mkdir()
+                udc = Path(tempfile.mkdtemp(dir=udcs)).name
+                configfs = root / "configfs"
+                (configfs / "usb_gadget").mkdir(parents=True)
+                mocks = ('log() { echo "$*"; }; '
+                         'bb() { case "$1" in mount) return 0 ;; mkdir|ln) "$@" ;; *) return 90 ;; esac; }; '
+                         'set_device_role() { echo role-requested; return ' + str(status) + '; };\n')
+                probe = function.replace("/sys/class/udc", str(udcs)).replace("/run/configfs", str(configfs))
+                result = subprocess.run(["sh", "-c", mocks + probe], capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertIn("role-requested", result.stdout)
+                binding = configfs / "usb_gadget/rodin/UDC"
+                if status == 0:
+                    self.assertEqual(binding.read_text(), udc + "\n")
+                else:
+                    self.assertFalse(binding.exists())
 
     def test_module_checksum_probe_synthetic_artifacts(self):
         with tempfile.TemporaryDirectory() as temp:

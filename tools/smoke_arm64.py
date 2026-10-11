@@ -71,6 +71,89 @@ def checksum_probe(command, listing, expected_success):
         raise ValueError("Unexpected ARM sha256sum result: " + repr(result))
 
 
+def role_switch_probe(shell, work):
+    # Execute the production function against synthetic sysfs, never the host's.
+    script = (ROOT / "initramfs/usb-init").read_text()
+    function = script[script.index("set_device_role() {"):script.index("\nusb_console()")]
+    cases = [
+        ("device", (True,), (), 0, 0),
+        ("already-device", (True,), (), 0, 0),
+        ("other-switch", (False, True), (), 0, 0),
+        ("no-class", (), (), 1, 30),
+        ("empty-class", (), (), 1, 30),
+        ("unrelated", (False,), (), 1, 30),
+        ("no-parent", (True,), (), 1, 0),
+        ("ambiguous", (True, True), (), 1, 0),
+        ("missing-attribute", (True,), (), 1, 0),
+        ("write-error", (True,), (), 1, 0),
+        ("read-error", (True,), (), 1, 0),
+        ("late-switch", (True,), (), 0, 2),
+        ("async", (True,), ("host", "none", "device"), 0, 2),
+        ("host-timeout", (True,), ("host",), 1, 10),
+        ("none-timeout", (True,), ("none",), 1, 10),
+    ]
+    cases += [("invalid-" + str(i), (True,), (value,), 1, 0)
+              for i, value in enumerate(("", "peripheral", "DEVICE", "device ", " device", "device\r"))]
+    for label, owners, readbacks, status, sleeps in cases:
+        with tempfile.TemporaryDirectory(prefix="role-", dir=work) as temp:
+            root = Path(temp)
+            classes = root / "class"
+            (classes / "udc").mkdir(parents=True)
+            controller = Path(tempfile.mkdtemp(prefix="controller-", dir=root))
+            udc = controller / "udc" / controller.name
+            udc.mkdir(parents=True)
+            if label != "no-parent":
+                (udc / "device").symlink_to("../..")
+            (classes / "udc" / udc.name).symlink_to(udc)
+            if label != "no-class":
+                (classes / "usb_role").mkdir()
+            attributes = []
+            delayed_link = ""
+            for owned in owners:
+                parent = controller if owned else Path(tempfile.mkdtemp(prefix="other-", dir=root))
+                (parent / "usb_role").mkdir(exist_ok=True)
+                node = Path(tempfile.mkdtemp(prefix="switch-", dir=parent / "usb_role"))
+                (node / "device").symlink_to("../..")
+                link = classes / "usb_role" / node.name
+                if label == "late-switch":
+                    delayed_link = ('[ "$sleeps" -ne 2 ] || ln -s '
+                                    + shlex.quote(str(node)) + " " + shlex.quote(str(link)) + "; ")
+                else:
+                    link.symlink_to(node)
+                attribute = node / "role"
+                if label == "missing-attribute":
+                    continue
+                if label == "write-error":
+                    attribute.mkdir()
+                    continue
+                initial = "device\n" if label == "already-device" else "host\n"
+                attribute.write_text(initial)
+                attributes.append((attribute, owned, initial))
+            mocks = ('log() { printf "%s\\n" "$*"; }; sleeps=0; '
+                     'bb() { [ "$1" = sleep ] || return 90; sleeps=$((sleeps + 1)); '
+                     + delayed_link + ':; };\n')
+            if label == "read-error":
+                mocks += 'read() { return 1; };\n'
+            elif readbacks:
+                mocks += 'reads=0; read() { reads=$((reads + 1)); case "$reads" in\n'
+                for index, value in enumerate(readbacks):
+                    pattern = "*" if index == len(readbacks) - 1 else str(index + 1)
+                    mocks += pattern + ") printf '%s\\n' " + shlex.quote(value) + ' > "$role_path" ;;\n'
+                mocks += 'esac; command read "$@"; };\n'
+            probe = mocks + function.replace("/sys/class", str(classes))
+            probe += '\nudc=$1; set_device_role; result=$?; printf "sleeps=%s\\n" "$sleeps"; exit "$result"'
+            result = subprocess.run(shell + ["-c", probe, "probe", udc.name],
+                                    capture_output=True, text=True, timeout=5)
+            if result.returncode != status or f"sleeps={sleeps}\n" not in result.stdout:
+                raise ValueError(f"USB role probe {label}: {result!r}")
+            if status == 0 and "USB role readback: device" not in result.stdout:
+                raise ValueError(f"USB role probe {label}: missing device readback log")
+            for attribute, owned, initial in attributes:
+                expected = "device\n" if owned and status == 0 else initial
+                if (status == 0 or not owned or label in ("ambiguous", "no-parent")) and attribute.read_text() != expected:
+                    raise ValueError(f"USB role probe {label}: unexpected write to {attribute}")
+
+
 def characterize(command, work):
     payload = work / "checksum-payload"
     payload.write_bytes(b"ARM checksum fixture\n")
@@ -94,6 +177,7 @@ def characterize(command, work):
             'major=$1; minor=$2; validate() { ' + rule + '; }; validate', "probe", major, minor])
         if (result.returncode == 0) != valid:
             raise ValueError("Unexpected tty device-number validation: " + repr(value))
+    role_switch_probe(command + ["ash"], work)
 
 
 def module_checksum_probe(command, work, build_dir):
@@ -159,7 +243,7 @@ def main():
         if not (links / "getty").is_symlink() or not (links / "sha256sum").is_symlink():
             raise ValueError("BusyBox applet installation failed")
         pty_probe(qemu, binary, work)
-    print("PASS: ARM64 applets, both ash syntax checks, sha256sum, read semantics, tty number validation, non-PID-1 refusal, applet installer, getty/shell PTY")
+    print("PASS: ARM64 applets, both ash syntax checks, sha256sum, read semantics, tty number validation, USB role selection/write/readback fixtures, non-PID-1 refusal, applet installer, getty/shell PTY")
     print("NOT TESTED: kernel init, module ABI/probe, ramdisk composition, AVB chain or USB hardware")
 
 
