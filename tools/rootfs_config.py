@@ -298,6 +298,31 @@ until [ -e /sys/class/net/wlan0 ]; do
 done
 log "wlan0 is up"
 '''
+PHOSH_SESSION = '''#!/bin/sh
+# Phosh session for rodin: no usable GPU driver on Linux (Mali blob is Android-only),
+# so wlroots renders with pixman and GTK4 with cairo.
+export WLR_RENDERER=pixman
+export GSK_RENDERER=cairo
+export GDK_DEBUG=gl-disable
+export LIBGL_ALWAYS_SOFTWARE=1
+export XDG_CURRENT_DESKTOP=Phosh:GNOME
+export XDG_SESSION_TYPE=wayland
+# Initial brightness (thermald leaves the backlight alone when BACKLIGHT is empty).
+[ -w /sys/class/leds/lcd-backlight/brightness ] && echo 3000 > /sys/class/leds/lcd-backlight/brightness
+exec /usr/bin/phosh-session
+'''
+GREETD_CONFIG = '''[terminal]
+# The kernel has no CONFIG_VT.
+vt = "none"
+
+[default_session]
+command = "agreety --cmd /bin/sh"
+user = "greetd"
+
+[initial_session]
+command = "/usr/local/bin/rodin-phosh-session"
+user = "marinadec"
+'''
 FILES = {
     '/etc/inittab': INITTAB,
     '/etc/hostname': 'rodin\n',
@@ -343,31 +368,6 @@ start() {
     echo 0 > /sys/class/touch/touch_dev/touch_doze_analysis
     eend $?
 }
-'''
-PHOSH_SESSION = '''#!/bin/sh
-# Phosh session for rodin: no usable GPU driver on Linux (Mali blob is Android-only),
-# so wlroots renders with pixman and GTK4 with cairo.
-export WLR_RENDERER=pixman
-export GSK_RENDERER=cairo
-export GDK_DEBUG=gl-disable
-export LIBGL_ALWAYS_SOFTWARE=1
-export XDG_CURRENT_DESKTOP=Phosh:GNOME
-export XDG_SESSION_TYPE=wayland
-# Initial brightness (thermald leaves the backlight alone when BACKLIGHT is empty).
-[ -w /sys/class/leds/lcd-backlight/brightness ] && echo 3000 > /sys/class/leds/lcd-backlight/brightness
-exec /usr/bin/phosh-session
-'''
-GREETD_CONFIG = '''[terminal]
-# The kernel has no CONFIG_VT.
-vt = "none"
-
-[default_session]
-command = "agreety --cmd /bin/sh"
-user = "greetd"
-
-[initial_session]
-command = "/usr/local/bin/rodin-phosh-session"
-user = "marinadec"
 '''
 SCRIPTS = {
     '/etc/init.d/rodin-dev': DEV,
