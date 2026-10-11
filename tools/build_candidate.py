@@ -12,9 +12,9 @@ import stat
 import struct
 import subprocess
 import tempfile
-import zlib
 
 import build_initramfs as ramfs
+import build_probe
 import inspect_boot
 import inspect_ramdisk
 import inspect_vendor_boot
@@ -31,7 +31,7 @@ AVB_PROPERTIES = {
     "com.android.build.init_boot.os_version": "16",
     "com.android.build.init_boot.fingerprint": "Xiaomi/lineage_rodin/rodin:16/BP4A.251205.006/eng.androi:userdebug/release-keys",
     "com.android.build.init_boot.security_patch": "2026-08-01",
-    "org.rodin.experiment": "host-only-usb-acm-003",
+    "org.rodin.experiment": "usb-acm-012-cmdline-params",
 }
 SEEDS = {
     "nvmem_mtk-devinfo.ko", "tinysys-scmi.ko", "mtk-scpsys.ko", "mtk-scpsys-mt6899.ko",
@@ -41,6 +41,21 @@ SEEDS = {
     "extcon-mtk-usb.ko", "tcpci_late_sync.ko", "mux_switch.ko", "ps5170.ko",
     "usb_dp_selector.ko",
 }
+# Never loaded even in the full plan: bootmonitor reuses the ramoops region
+# (0x6ec00000) that carries our pstore boot log; the others can write oops
+# data to a block device or deliberately crash; mtk_printk_ctrl/log_store
+# (no dependants) are suspected of detaching the ramoops console.
+FULL_PLAN_SKIP = {"bootmonitor.ko", "mtdoops.ko", "block2mtd.ko", "crash_module.ko",
+                  "mtk_printk_ctrl.ko", "log_store.ko",
+                  # bisected 2026-10-11: loading it resets the phone within ~40 s
+                  # without Android userspace; dependants are dropped with it.
+                  "bq28z610.ko",
+                  # UFS scan resets the phone; RPMB-over-TEE and Xiaomi UFS health
+                  # are the first suspects (mtk_mmc is eMMC and depends on rpmb_mtk).
+                  "rpmb-mtk.ko", "mi_memory.ko"}
+# Loaded first by usb-init: the watchdog it then feeds from userspace and the
+# syscon reboot-mode chain that makes reboot("bootloader") work (deadline recovery).
+EARLY_MODULES = ["mtk_wdt.ko", "reboot-mode.ko", "syscon-reboot-mode.ko"]
 MODULE_PATH = re.compile(r"/lib/modules/[A-Za-z0-9_-]+\.ko\Z")
 EXCLUDED_MODULES = {"mtk_wdt.ko", "bootmonitor.ko", "monitor_hang.ko", "aee_hangdet.ko",
                     "mtk-mmc.ko", "ufs-mediatek-mod.ko", "crash_module.ko",
@@ -51,8 +66,12 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def module_plan(load_text, dep_text, available):
-    """Declared symbol dependency closure, not a proof of DT/probe completeness."""
+def module_plan(load_text, dep_text, available, full=False):
+    """Declared symbol dependency closure, not a proof of DT/probe completeness.
+
+    full=True mirrors Android first-stage init: every modules.load entry in order
+    (incl. mtk_wdt, which keeps the bootloader-armed watchdog fed, and storage
+    drivers, which are probed but never mounted)."""
     loads = load_text.splitlines()
     if len(set(loads)) != len(loads):
         # The pinned load list repeats mtk_dramc; stable deduplication is intentional.
@@ -63,6 +82,8 @@ def module_plan(load_text, dep_text, available):
     selected = {n for n in loads if n in SEEDS or n.startswith("clk-mt6899")
                 or n == "clk-common.ko" or n.startswith("pinctrl-mtk-v2")
                 or n == "pinctrl-mt6899.ko" or n.endswith("-regulator.ko")}
+    if full:
+        selected = set(loads) - FULL_PLAN_SKIP
     if not SEEDS <= selected:
         raise ValueError("Missing mandatory module seed")
     deps = {}
@@ -72,6 +93,17 @@ def module_plan(load_text, dep_text, available):
         if not separator or key in deps or not all(MODULE_PATH.fullmatch(x) for x in [key, *children]):
             raise ValueError("Malformed/unsafe module dependencies")
         deps[key] = children
+    if full:
+        # Drop every entry whose declared dependency closure reaches a skipped module.
+        tainted = {"/lib/modules/" + n for n in FULL_PLAN_SKIP}
+        changed = True
+        while changed:
+            changed = False
+            for key, children in deps.items():
+                if key not in tainted and tainted.intersection(children):
+                    tainted.add(key)
+                    changed = True
+        selected = {n for n in selected if "/lib/modules/" + n not in tainted}
     order, active, done = [], set(), set()
 
     def visit(path):
@@ -79,7 +111,7 @@ def module_plan(load_text, dep_text, available):
             return
         if path in active:
             raise ValueError("Module dependency cycle")
-        if Path(path).name in EXCLUDED_MODULES:
+        if Path(path).name in (FULL_PLAN_SKIP if full else EXCLUDED_MODULES):
             raise ValueError("Provisional USB plan must not pull storage/watchdog/crash drivers")
         if path not in deps or path.lstrip("/") not in available:
             raise ValueError("Missing module or dependency metadata")
@@ -90,6 +122,9 @@ def module_plan(load_text, dep_text, available):
         done.add(path)
         order.append(path)
 
+    if full:
+        for name in EARLY_MODULES:
+            visit("/lib/modules/" + name)
     for name in loads:
         if name in selected:
             visit("/lib/modules/" + name)
@@ -118,6 +153,15 @@ def decompress_lz4(data, lz4):
             raise ValueError("LZ4 expansion too large")
         out.seek(0)
         return out.read()
+
+
+def compress_lz4_legacy(cpio, lz4):
+    # The bootloader concatenates the LZ4-legacy vendor ramdisk before this one; a gzip
+    # member after it was observed (2026-10-11 probes) to stop the kernel before /init.
+    data = subprocess.run([lz4, "-l", "-12", "-c"], input=cpio, stdout=subprocess.PIPE, check=True).stdout
+    if data[:4] != b"\x02\x21\x4c\x18":
+        raise ValueError("Expected LZ4 legacy ramdisk")
+    return data
 
 
 def kernel_config(kernel):
@@ -173,6 +217,10 @@ def main():
     parser.add_argument("--ota-dir", type=Path, default=ROOT / "build" / "ota")
     parser.add_argument("--apk", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=ROOT / "build" / "candidate")
+    parser.add_argument("--load-late", action="store_true",
+                        help="Also load modules after the USB-ready prefix once the shell is up")
+    parser.add_argument("--stop-after", type=int,
+                        help="Bisection probe: load only the first N plan modules, then reboot to the bootloader")
     parser.add_argument("--verify-only", action="store_true",
                         help="Rebuild in temporary storage and compare every existing artifact; do not replace outputs")
     args = parser.parse_args()
@@ -198,7 +246,7 @@ def main():
     config = kernel_config(decompress_lz4(originals["boot.img"][start:start + size], lz4))
     files = platform_members(originals["vendor_boot.img"], lz4)
     order = module_plan(files["lib/modules/modules.load"].decode(),
-                        files["lib/modules/modules.dep"].decode(), files)
+                        files["lib/modules/modules.dep"].decode(), files, full=True)
     plan, checksums = [], []
     for path in order:
         data = files[path.lstrip("/")]
@@ -208,11 +256,22 @@ def main():
         plan.append(f"{path} {names[0].decode()}\n")
         checksums.append(f"{digest(data)}  {path}\n")
     extra = [(n, stat.S_IFDIR | 0o755, b"", 0, 0) for n in ("etc", "etc/rodin")]
+    # USB-ready prefix: everything up to the last USB/Type-C provider in plan order.
+    usb_last = max((i for i, path in enumerate(order) if Path(path).name in
+                    {"mtu3.ko", "phy-mtk-xsphy.ko", "tcpc_mt6375.ko", "rt_pd_manager.ko", "tcpci_late_sync.ko"}),
+                   default=len(order) - 1)
+    extra.append(("etc/rodin/usb-phase", stat.S_IFREG | 0o600, f"{usb_last + 1}\n".encode(), 0, 0))
+    if args.load_late:
+        extra.append(("etc/rodin/load-late", stat.S_IFREG | 0o600, b"", 0, 0))
+    if args.stop_after is not None:
+        extra.append(("etc/rodin/stop-after", stat.S_IFREG | 0o600, f"{args.stop_after}\n".encode(), 0, 0))
+    extra.append(("bin/reboot-bootloader", stat.S_IFREG | 0o755, build_probe.reboot_init(delay=0), 0, 0))
     for name, text in (("modules.load", "".join(plan)), ("modules.sha256", "".join(checksums))):
         extra.append(("etc/rodin/" + name, stat.S_IFREG | 0o600, text.encode(), 0, 0))
     init = (ROOT / "initramfs" / "usb-init").read_bytes()
     binary = ramfs.read_busybox(args.apk)
-    cpio, compressed = ramfs.build(binary, init, extra)
+    cpio, _ = ramfs.build(binary, init, extra)
+    compressed = compress_lz4_legacy(cpio, lz4)
     raw = unsigned_image(originals["init_boot.img"], compressed)
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=output) as work:
@@ -233,22 +292,22 @@ def main():
         raise ValueError("Candidate size/ramdisk round-trip check failed")
     manifest = {
         "status": "HOST-ONLY UNBOOTED CANDIDATE; not approved for flashing",
-        "experiment": "003-usb-acm", "target_partition": "init_boot (slot not selected)",
+        "experiment": "012-usb-acm-cmdline-params", "target_partition": "init_boot (slot not selected)",
         "candidate_sha256": digest(candidate), "candidate_size": len(candidate),
         "original_restore_sha256": ORIGINAL_HASHES, "kernel_and_vendor_boot_modified": False,
         "busybox_apk_sha256": ramfs.APK_SHA256, "usb_init_sha256": digest(init),
-        "ramdisk_gzip_sha256": digest(compressed), "ramdisk_gzip_size": len(compressed),
-        "zlib_version": zlib.ZLIB_VERSION,
+        "ramdisk_lz4_sha256": digest(compressed), "ramdisk_lz4_size": len(compressed),
+        "lz4_version": subprocess.check_output([lz4, "--version"], text=True).split(",")[0].strip("* \n"),
         "avbtool_version": version, "avbtool_file_sha256": digest(Path(avbtool).read_bytes()),
         "avb_algorithm": "NONE (same as original init_boot)", "avb_chain_acceptance": "unproven",
         "ota_kernel_config_sha256": digest(config),
         "module_count": len(order), "module_plan_sha256": digest("".join(plan).encode()),
-        "module_strategy": "provisional provider/USB seeds plus declared dependency closure",
+        "module_strategy": "full PLATFORM modules.load in Android order plus declared dependency closure",
         "runtime_validation": "not boot-tested; no USB controller or module initialization demonstrated",
         "layout": layout,
     }
     artifacts = {"init_boot-candidate.img": candidate, "initramfs.cpio": cpio,
-                 "initramfs.cpio.gz": compressed, "avb-info.txt": info,
+                 "initramfs.cpio.lz4": compressed, "avb-info.txt": info,
                  "modules.load": "".join(plan).encode(), "modules.sha256": "".join(checksums).encode(),
                  "manifest.json": (json.dumps(manifest, indent=2) + "\n").encode()}
     for name, data in artifacts.items():

@@ -28,9 +28,64 @@ bb --install -s /bin || fatal "BusyBox applet installation"
 # proc/sysfs are needed before deriving dynamic tty device numbers.
 bb mount -t proc proc /proc || fatal "proc mount"
 bb mount -t sysfs sysfs /sys || fatal "sysfs mount"
+# Keep every progress line: the pstore console is the only log channel after a reset.
+echo on > /proc/sys/kernel/printk_devkmsg 2>/dev/null
 bb mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run || fatal "run mount"
 bb mount -t devpts -o mode=0620,gid=5 devpts /dev/pts || fatal "devpts mount"
 log "USB ACM candidate; no Android init, no storage mounts"
+
+early_watchdog() {
+    # The bootloader arms the hardware watchdog; load its driver first and feed it
+    # from userspace, then load reboot-mode so the deadline can reach fastboot.
+    bb head -n 3 /etc/rodin/modules.sha256 | bb sha256sum -c >> /run/rodin-bringup.log 2>&1 || {
+        log "early module integrity check failed"; return 1; }
+    for module in /lib/modules/mtk_wdt.ko /lib/modules/reboot-mode.ko /lib/modules/syscon-reboot-mode.ko; do
+        if bb insmod "$module" >> /run/rodin-bringup.log 2>&1; then
+            log "early inserted $module"
+        else
+            log "early insert failed: $module"
+        fi
+    done
+    count=0
+    while [ ! -r /sys/class/watchdog/watchdog0/dev ] && [ "$count" -lt 5 ]; do
+        bb sleep 1
+        count=$((count + 1))
+    done
+    [ -r /sys/class/watchdog/watchdog0/dev ] || { log "no watchdog0 registered"; return 1; }
+    IFS=: read -r major minor < /sys/class/watchdog/watchdog0/dev
+    case "$major:$minor" in *[!0-9:]*|:*|*:|*:*:*) return 1 ;; esac
+    bb mknod -m 600 /dev/watchdog0 c "$major" "$minor" || return 1
+    bb watchdog -T 60 -t 5 /dev/watchdog0 && log "feeding watchdog0 every 5 s"
+}
+early_watchdog || log "early watchdog setup incomplete"
+
+# Without a console the only recovery is a warm reboot to fastboot, which also
+# keeps the ramoops console for the next Android boot to report.
+(
+    bb sleep 120
+    state=
+    for path in /sys/class/udc/*/state; do [ -r "$path" ] && IFS= read -r state < "$path"; done
+    if [ "$state" != configured ]; then
+        log "deadline: UDC state '${state:-none}' after 120 s; rebooting to bootloader"
+        bb sync
+        /bin/reboot-bootloader
+    fi
+    log "deadline: UDC configured; staying up"
+) &
+
+module_args() {
+    # Like Android's libmodprobe/kmod: pass "<module>.<param>=<value>" words from
+    # the kernel command line (e.g. hwid.project_name) to insmod; '-' == '_'.
+    wanted=$(echo "$1" | bb tr - _)
+    for word in $(bb cat /proc/cmdline); do
+        case "$word" in
+            *.*=*) ;;
+            *) continue ;;
+        esac
+        key=$(echo "${word%%.*}" | bb tr - _)
+        [ "$key" = "$wanted" ] && printf ' %s' "${word#*.}"
+    done
+}
 
 load_modules() {
     # Reject wrong ramdisk/module combinations before any module insertion.
@@ -43,21 +98,48 @@ load_modules() {
         return 1
     fi
     failures=0
+    malformed=0
+    stop_after=
+    [ -r /etc/rodin/stop-after ] && read -r stop_after < /etc/rodin/stop-after
+    # "early" stops after the USB-ready prefix, "late" loads only the remainder.
+    mode=${1:-all}
+    phase_end=
+    [ -r /etc/rodin/usb-phase ] && read -r phase_end < /etc/rodin/usb-phase
+    loaded=0
     while read -r module name; do
+        if [ -n "$phase_end" ]; then
+            case "$mode" in
+                early) [ "$loaded" -ge "$phase_end" ] && break ;;
+                late) if [ "$loaded" -lt "$phase_end" ]; then loaded=$((loaded + 1)); continue; fi ;;
+            esac
+        fi
+        if [ -n "$stop_after" ] && [ "$loaded" -ge "$stop_after" ]; then
+            # Hold 40 s so a delayed (timer/probe) failure still shows up as a reset.
+            log "bisection: stopping after $loaded modules; holding 40 s"
+            bb sleep 40
+            log "bisection: survived; rebooting to bootloader"
+            bb sync
+            /bin/reboot-bootloader
+        fi
+        loaded=$((loaded + 1))
         if [ -z "$name" ]; then
             log "module load entry has no name; USB setup aborted"
-            failures=$((failures + 1))
+            malformed=$((malformed + 1))
             continue
         fi
         if [ -d "/sys/module/$name" ]; then continue; fi
-        if bb insmod "$module" >> /run/rodin-bringup.log 2>&1; then
-            log "inserted $name"
+        args=$(module_args "$name")
+        # Word splitting of $args is intended: one cmdline word per parameter.
+        if bb insmod "$module" $args >> /run/rodin-bringup.log 2>&1; then
+            log "inserted $name${args:+ with$args}"
         else
             log "failed to insert $name"
             failures=$((failures + 1))
         fi
     done < /etc/rodin/modules.load
-    [ "$failures" -eq 0 ] || return 1
+    [ "$malformed" -eq 0 ] || return 1
+    # Best effort like a first stage: a failed optional driver must not block USB.
+    [ "$failures" -eq 0 ] || log "$failures module(s) failed to insert; continuing"
 }
 
 set_device_role() {
@@ -142,6 +224,7 @@ usb_console() {
     set_device_role || return 1
     echo "$udc" > "$gadget/UDC" || return 1
     log "ACM bound to $udc"
+    : > /run/rodin-usb-bound
 
     count=0
     while [ ! -r /sys/class/tty/ttyGS0/dev ] && [ "$count" -lt 10 ]; do
@@ -154,15 +237,28 @@ usb_console() {
     case "$major:$minor" in *[!0-9:]*|:*|*:|*:*:*) return 1 ;; esac
     bb mknod -m 600 /dev/ttyGS0 c "$major" "$minor" || return 1
     log "ttyGS0 ready; shell has no password (local research only)"
-    while :; do
-        bb setsid /bin/busybox getty -L -n -l /bin/sh 115200 ttyGS0 vt100
-        log "USB shell ended; restarting getty"
-        bb sleep 1
-    done
+    (
+        while :; do
+            bb setsid /bin/busybox getty -L -n -l /bin/sh 115200 ttyGS0 vt100
+            log "USB shell ended; restarting getty"
+            bb sleep 1
+        done
+    ) &
 }
 
-if load_modules; then
-    usb_console || log "USB console initialization failed"
+if load_modules early; then
+    if usb_console; then
+        # Remaining drivers load behind a live shell so a late failure is observable.
+        if [ -e /etc/rodin/load-late ]; then
+            log "USB console up; loading remaining modules"
+            load_modules late
+            log "late module loading finished"
+        else
+            log "USB console up; late modules left unloaded (see /etc/rodin/modules.load)"
+        fi
+        while :; do bb sleep 3600; done
+    fi
+    log "USB console initialization failed"
 else
     log "module insertion failed; USB setup skipped"
 fi

@@ -10,7 +10,6 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
-import zlib
 
 from test_host_tools import vendor_image
 
@@ -144,13 +143,15 @@ class CandidateTests(unittest.TestCase):
             unsigned = candidate.unsigned_image
             mocks = [(candidate, "ROOT", root),
                      (candidate, "ORIGINAL_HASHES", {n: candidate.digest(original) for n in candidate.ORIGINAL_HASHES}),
-                     (candidate, "SEEDS", {"seed-one.ko"})]
+                     (candidate, "SEEDS", {"seed-one.ko"}),
+                     (candidate, "EARLY_MODULES", ["provider.ko"])]
             for obj, name, value in mocks:
                 stack.enter_context(patch.object(obj, name, value))
             stack.enter_context(patch.object(candidate.shutil, "which", return_value=str(tool)))
-            stack.enter_context(patch.object(candidate.subprocess, "check_output", side_effect=["avbtool 1.4.0\n", b"fixture AVB info"]))
+            stack.enter_context(patch.object(candidate.subprocess, "check_output", side_effect=["avbtool 1.4.0\n", b"fixture AVB info", "*** lz4 v1.10.0 64-bit multithread, by Yann Collet ***\n"]))
             stack.enter_context(patch.object(candidate.subprocess, "run"))
             stack.enter_context(patch.object(candidate, "decompress_lz4", return_value=b"kernel"))
+            stack.enter_context(patch.object(candidate, "compress_lz4_legacy", side_effect=lambda cpio, lz4: b"\x02\x21\x4c\x18" + cpio))
             stack.enter_context(patch.object(candidate, "kernel_config", return_value=b"config"))
             stack.enter_context(patch.object(candidate, "platform_members", return_value=files))
             stack.enter_context(patch.object(ramfs, "read_busybox", return_value=b"fixture binary"))
@@ -164,7 +165,7 @@ class CandidateTests(unittest.TestCase):
             for line in loads:
                 self.assertRegex(line, r"^/lib/modules/[A-Za-z0-9_-]+\.ko [A-Za-z0-9_]+$")
             self.assertEqual(len(loads), manifest["module_count"])
-            self.assertEqual(manifest["zlib_version"], zlib.ZLIB_VERSION)
+            self.assertEqual(manifest["lz4_version"], "lz4 v1.10.0 64-bit multithread")
             sums = dict(line.split()[::-1] for line in (output / "modules.sha256").read_text().splitlines())
             self.assertEqual(set(sums), {line.split()[0] for line in loads})
             staged = root / "staged"
@@ -235,6 +236,24 @@ class CandidateTests(unittest.TestCase):
                 result = self.module_loader(Path(temp), content)
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("entry has no name", result.stdout)
+
+    def test_module_loader_continues_after_insert_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result = self.module_loader(Path(temp), "/lib/modules/example.ko example\n")
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("failed to insert example", result.stdout)
+            self.assertIn("1 module(s) failed to insert; continuing", result.stdout)
+
+    def test_module_args_from_kernel_cmdline(self):
+        script = (ROOT / "initramfs/usb-init").read_text()
+        function = script[script.index("module_args() {"):script.index("\nload_modules() {")]
+        function = function.replace("bb cat /proc/cmdline", "echo $CMDLINE")
+        cmdline = "root=/dev/ram hwid.project_name=rodin panel-o10.oled_wp=01 hwid.project=2 x.y"
+        for name, expected in (("hwid", " project_name=rodin project=2"), ("panel_o10", " oled_wp=01"), ("mtu3", "")):
+            with self.subTest(name=name):
+                result = subprocess.run(["sh", "-c", 'bb() { "$@"; }; ' + function + f'\nmodule_args {name}'],
+                                        capture_output=True, text=True, env={"CMDLINE": cmdline, "PATH": "/usr/bin:/bin"})
+                self.assertEqual(result.stdout, expected, result.stderr)
 
     def test_usb_role_switch_synthetic_sysfs(self):
         with tempfile.TemporaryDirectory() as temp:
