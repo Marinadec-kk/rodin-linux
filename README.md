@@ -47,6 +47,29 @@ A shell inside Android/chroot/proot is not the target and must not be reported a
 - [ ] Experimental postmarketOS packaging.
 - [ ] Storage, display, touch, Wi-Fi, thermal and power-management validation.
 
+## Host module inventory
+
+Inspect uncompressed ARM64 `.ko` files without loading them. Inputs can be an
+uncompressed newc CPIO or an already extracted directory tree; repeat `--input`
+to combine PLATFORM, vendor_dlkm and system_dlkm contents. EROFS images must be
+extracted separately with a host tool; they are not CPIO inputs.
+
+```bash
+python3 tools/inspect_modules.py \
+  --input build/inspection/ota-platform.cpio \
+  > build/module-inventory.json
+```
+
+Optional `--firmware-root PATH` (repeatable) checks declared firmware names
+relative to extracted firmware directories. Without these roots firmware is
+reported as `not_checked`, not missing. The JSON includes hashes, vermagic,
+aliases, declared dependencies, ambiguous providers and heuristic USB/Wi-Fi/
+Bluetooth/connectivity hints. Unresolved dependencies may be built into the
+kernel or present in unexamined inputs. Firmware declarations are not exhaustive,
+and none of these checks proves driver probing, ABI compatibility or operation
+without Android HAL/vendor services. Keep extracted files and reports in ignored
+`build/`; this tool does not inspect the phone or change candidate images.
+
 ## Sources
 
 - [crDroid rodin device tree](https://github.com/crdroidandroid/android_device_xiaomi_rodin/tree/16.0)
