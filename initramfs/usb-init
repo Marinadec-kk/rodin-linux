@@ -72,6 +72,7 @@ early_watchdog || log "early watchdog setup incomplete"
     fi
     log "deadline: UDC configured; staying up"
 ) &
+deadline_pid=$!
 
 module_args() {
     # Like Android's libmodprobe/kmod: pass "<module>.<param>=<value>" words from
@@ -221,6 +222,12 @@ usb_console() {
     # MaxPower is mA in configfs. No PD negotiation or charger sysfs writes.
     echo 100 > "$gadget/configs/c.1/MaxPower" || return 1
     bb ln -s "$gadget/functions/acm.usb0" "$gadget/configs/c.1/acm.usb0" || return 1
+    # USB networking (usb0 on the phone) for SSH; the console must not depend on it.
+    if bb mkdir "$gadget/functions/ncm.usb0" && bb ln -s "$gadget/functions/ncm.usb0" "$gadget/configs/c.1/ncm.usb0"; then
+        log "NCM function added"
+    else
+        log "NCM function unavailable; ACM only"
+    fi
     set_device_role || return 1
     echo "$udc" > "$gadget/UDC" || return 1
     log "ACM bound to $udc"
@@ -244,6 +251,54 @@ usb_console() {
             bb sleep 1
         done
     ) &
+    getty_pid=$!
+}
+
+switch_to_rootfs() {
+    # Hand over to the Linux system on userdata (ext4, /sbin/init). Any problem
+    # leaves this stage-1 shell running; `touch /run/rodin-stay` within 10 s too.
+    count=0
+    dev=
+    while [ -z "$dev" ] && [ "$count" -lt 20 ]; do
+        for uevent in /sys/class/block/*/uevent; do
+            bb grep -qx PARTNAME=userdata "$uevent" 2>/dev/null || continue
+            dev=${uevent%/uevent}
+        done
+        [ -n "$dev" ] || { bb sleep 1; count=$((count + 1)); }
+    done
+    [ -n "$dev" ] || { log "rootfs: userdata partition not found; staying in stage 1"; return 1; }
+    IFS=: read -r major minor < "$dev/dev"
+    case "$major:$minor" in *[!0-9:]*|:*|*:|*:*:*) return 1 ;; esac
+    bb mknod -m 600 /dev/userdata b "$major" "$minor" 2>/dev/null || [ -b /dev/userdata ] || return 1
+    bb mkdir -p /newroot
+    if ! bb mount -t ext4 -o noatime /dev/userdata /newroot 2>> /run/rodin-bringup.log; then
+        log "rootfs: userdata is not a mountable ext4 filesystem; staying in stage 1"
+        return 1
+    fi
+    if [ ! -x /newroot/sbin/init ] || [ -e /newroot/etc/rodin/stage1-only ]; then
+        log "rootfs: no /sbin/init or stage1-only flag; staying in stage 1 (mounted at /newroot)"
+        return 1
+    fi
+    log "rootfs: switching to userdata in 10 s (touch /run/rodin-stay to abort)"
+    bb sleep 10
+    if [ -e /run/rodin-stay ]; then
+        log "rootfs: switch aborted by /run/rodin-stay (mounted at /newroot)"
+        return 1
+    fi
+    # The new init owns ttyGS0 and USB networking; the watchdog feeder keeps running.
+    [ -n "${deadline_pid:-}" ] && kill "$deadline_pid" 2>/dev/null
+    [ -n "${getty_pid:-}" ] && kill "$getty_pid" 2>/dev/null
+    bb pkill -f "getty -L -n -l /bin/sh 115200 ttyGS0" 2>/dev/null
+    bb cp /run/rodin-bringup.log /newroot/var/log/rodin-stage1.log 2>/dev/null
+    for mount in /dev/pts /proc /sys /run; do
+        bb mkdir -p "/newroot$mount"
+    done
+    bb umount /dev/pts 2>/dev/null
+    bb mount --move /sys /newroot/sys
+    bb mount --move /proc /newroot/proc
+    bb mount --move /run /newroot/run
+    log "rootfs: exec switch_root"
+    exec bb switch_root /newroot /sbin/init
 }
 
 if load_modules early; then
@@ -256,6 +311,7 @@ if load_modules early; then
         else
             log "USB console up; late modules left unloaded (see /etc/rodin/modules.load)"
         fi
+        switch_to_rootfs
         while :; do bb sleep 3600; done
     fi
     log "USB console initialization failed"

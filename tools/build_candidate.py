@@ -31,7 +31,7 @@ AVB_PROPERTIES = {
     "com.android.build.init_boot.os_version": "16",
     "com.android.build.init_boot.fingerprint": "Xiaomi/lineage_rodin/rodin:16/BP4A.251205.006/eng.androi:userdebug/release-keys",
     "com.android.build.init_boot.security_patch": "2026-08-01",
-    "org.rodin.experiment": "usb-acm-012-cmdline-params",
+    "org.rodin.experiment": "stage1-013-switch-root",
 }
 SEEDS = {
     "nvmem_mtk-devinfo.ko", "tinysys-scmi.ko", "mtk-scpsys.ko", "mtk-scpsys-mt6899.ko",
@@ -47,12 +47,9 @@ SEEDS = {
 # (no dependants) are suspected of detaching the ramoops console.
 FULL_PLAN_SKIP = {"bootmonitor.ko", "mtdoops.ko", "block2mtd.ko", "crash_module.ko",
                   "mtk_printk_ctrl.ko", "log_store.ko",
-                  # bisected 2026-10-11: loading it resets the phone within ~40 s
-                  # without Android userspace; dependants are dropped with it.
-                  "bq28z610.ko",
-                  # UFS scan resets the phone; RPMB-over-TEE and Xiaomi UFS health
-                  # are the first suspects (mtk_mmc is eMMC and depends on rpmb_mtk).
-                  "rpmb-mtk.ko", "mi_memory.ko"}
+}
+# bq28z610, rpmb-mtk and mi_memory only crashed while cmdline module params
+# (hwid.project_name) were missing; all load cleanly with module_args.
 # Loaded first by usb-init: the watchdog it then feeds from userspace and the
 # syscon reboot-mode chain that makes reboot("bootloader") work (deadline recovery).
 EARLY_MODULES = ["mtk_wdt.ko", "reboot-mode.ko", "syscon-reboot-mode.ko"]
@@ -217,8 +214,8 @@ def main():
     parser.add_argument("--ota-dir", type=Path, default=ROOT / "build" / "ota")
     parser.add_argument("--apk", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=ROOT / "build" / "candidate")
-    parser.add_argument("--load-late", action="store_true",
-                        help="Also load modules after the USB-ready prefix once the shell is up")
+    parser.add_argument("--no-late", action="store_true",
+                        help="Do not load modules after the USB-ready prefix (debug)")
     parser.add_argument("--stop-after", type=int,
                         help="Bisection probe: load only the first N plan modules, then reboot to the bootloader")
     parser.add_argument("--verify-only", action="store_true",
@@ -261,7 +258,7 @@ def main():
                     {"mtu3.ko", "phy-mtk-xsphy.ko", "tcpc_mt6375.ko", "rt_pd_manager.ko", "tcpci_late_sync.ko"}),
                    default=len(order) - 1)
     extra.append(("etc/rodin/usb-phase", stat.S_IFREG | 0o600, f"{usb_last + 1}\n".encode(), 0, 0))
-    if args.load_late:
+    if not args.no_late:
         extra.append(("etc/rodin/load-late", stat.S_IFREG | 0o600, b"", 0, 0))
     if args.stop_after is not None:
         extra.append(("etc/rodin/stop-after", stat.S_IFREG | 0o600, f"{args.stop_after}\n".encode(), 0, 0))
@@ -292,7 +289,7 @@ def main():
         raise ValueError("Candidate size/ramdisk round-trip check failed")
     manifest = {
         "status": "HOST-ONLY UNBOOTED CANDIDATE; not approved for flashing",
-        "experiment": "012-usb-acm-cmdline-params", "target_partition": "init_boot (slot not selected)",
+        "experiment": "013-stage1-switch-root", "target_partition": "init_boot (slot not selected)",
         "candidate_sha256": digest(candidate), "candidate_size": len(candidate),
         "original_restore_sha256": ORIGINAL_HASHES, "kernel_and_vendor_boot_modified": False,
         "busybox_apk_sha256": ramfs.APK_SHA256, "usb_init_sha256": digest(init),
