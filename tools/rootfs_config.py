@@ -309,6 +309,8 @@ FILES = {
     '/etc/conf.d/rodin-thermal': THERMAL_CONF,
     # No CONFIG_VT: a VT-bound seat never becomes active.
     '/etc/conf.d/seatd': 'export SEATD_VTBOUND=0\n',
+    '/etc/greetd/config.toml': GREETD_CONFIG,
+    '/etc/conf.d/greetd': 'rc_need="dbus elogind"\nrc_after="rodin-touch"\n',
     '/etc/apk/repositories': 'https://mirrors.dotsrc.org/alpine/v3.23/main\nhttps://mirrors.dotsrc.org/alpine/v3.23/community\n',
     '/etc/udhcpd.conf': 'start 172.16.42.2\nend 172.16.42.2\ninterface usb0\nmax_leases 1\nlease_file /var/lib/udhcpd/leases\npidfile /run/udhcpd.pid\noption subnet 255.255.255.0\n',
     '/etc/wpa_supplicant/wpa_supplicant.conf': 'ctrl_interface=/run/wpa_supplicant\nupdate_config=1\ncountry=RU\n# Add networks locally; Wi-Fi service is not enabled.\n',
@@ -342,19 +344,45 @@ start() {
     eend $?
 }
 '''
+PHOSH_SESSION = '''#!/bin/sh
+# Phosh session for rodin: no usable GPU driver on Linux (Mali blob is Android-only),
+# so wlroots renders with pixman and GTK4 with cairo.
+export WLR_RENDERER=pixman
+export GSK_RENDERER=cairo
+export GDK_DEBUG=gl-disable
+export LIBGL_ALWAYS_SOFTWARE=1
+export XDG_CURRENT_DESKTOP=Phosh:GNOME
+export XDG_SESSION_TYPE=wayland
+# Initial brightness (thermald leaves the backlight alone when BACKLIGHT is empty).
+[ -w /sys/class/leds/lcd-backlight/brightness ] && echo 3000 > /sys/class/leds/lcd-backlight/brightness
+exec /usr/bin/phosh-session
+'''
+GREETD_CONFIG = '''[terminal]
+# The kernel has no CONFIG_VT.
+vt = "none"
+
+[default_session]
+command = "agreety --cmd /bin/sh"
+user = "greetd"
+
+[initial_session]
+command = "/usr/local/bin/rodin-phosh-session"
+user = "marinadec"
+'''
 SCRIPTS = {
     '/etc/init.d/rodin-dev': DEV,
     '/etc/init.d/rodin-usbnet': USBNET,
     '/etc/init.d/rodin-thermal': THERMAL_SERVICE,
     '/etc/init.d/rodin-wifi': WIFI,
     '/etc/init.d/rodin-touch': TOUCH,
+    '/usr/local/bin/rodin-phosh-session': PHOSH_SESSION,
     '/usr/local/sbin/rodin-thermald': THERMALD,
     '/etc/rodin/wifi-poweron.sh': WIFI_POWERON,
 }
 RUNLEVELS = {
     'sysinit': ['procfs', 'sysfs', 'rodin-dev', 'syslog', 'klogd'],
     'boot': ['rodin-thermal', 'hostname', 'bootmisc', 'localmount', 'sysctl'],
-    'default': ['rodin-usbnet', 'sshd', 'rodin-touch'],
+    'default': ['rodin-usbnet', 'sshd', 'rodin-touch', 'dbus', 'elogind', 'greetd'],
     'shutdown': ['killprocs', 'mount-ro'],
 }
 
