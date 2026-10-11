@@ -35,7 +35,8 @@ A shell inside Android/chroot/proot is not the target and must not be reported a
 
 - [x] Create isolated research repository and branch.
 - [x] Initial read-only inventory: kernel/config, partition names and vendor module filenames. See [device inventory](docs/device-inventory.md).
-- [ ] Extended inventory: host-side boot image format, DT compatibles, module load order and demonstrated USB gadget capabilities.
+- [x] Host-side extended inventory: boot image format, module load order and DT compatibles with owner/provider cross-check (`inspect_dtb`, `check_dt_modules`). See [USB provider audit](docs/usb-provider-audit.md).
+- [ ] Demonstrated USB gadget capabilities on hardware.
 - [ ] Locate and audit rodin/MT6899 kernel sources and licensing; identify missing components.
 - [ ] Confirm recovery path and privately preserve matching restore artifacts.
 - [x] Host-only minimal ARM64 initramfs build and vendor_boot v4 inspection, with tests. See [experiment 001](docs/host-bringup.md).
