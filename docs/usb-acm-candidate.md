@@ -31,8 +31,8 @@ Observed local result:
 
 | Artifact | Bytes / SHA-256 |
 | --- | --- |
-| `init_boot-candidate.img` | 8,388,608 bytes; `4b615d1408d3549aa7828d218a676ac610f31248e7ca28c0fc15e1a9c5ee5f31` |
-| `initramfs.cpio.gz` | 660,437 bytes; `af1dec009149f5f1ec0db3b335c8d6231d20382c961726229e9eff02c548b02f` |
+| `init_boot-candidate.img` | 8,388,608 bytes; `301c260ebb3f2a41f4c002dc2dafceea35f1a6e9065e177d9fa0a8e8672f46fb` |
+| `initramfs.cpio.gz` | 660,903 bytes; `07825db82b443146cba95a6360ebb82a06b72f1a560342ba1e3ec7b73519db0f` |
 | embedded OTA kernel config | `9b544345144b5e7d050981905a655308700151693ddf9d10f94eee1eadeb19ec` |
 | selected module load plan | 90 entries; `407f55f7b1812cc1b6c8d40702599c607cf07842530b0505c1b2592add84044c` |
 
@@ -64,8 +64,9 @@ The official OTA top-level vbmeta is RSA4096 signed, contains original init_boot
 3. Check the expected SHA-256 of every selected module under `/lib/modules` against the OTA platform fragment. Wrong ramdisk/module combinations abort USB initialization.
 4. Insert modules once in dependency order, without forcing vermagic/signatures. Any insertion failure prevents USB setup and is logged to `/run/rodin-bringup.log` and kernel messages.
 5. Mount configfs inside `/run`; wait up to 30 seconds for a single UDC. No Android property is assumed and multiple controllers cause a safe selection failure.
-6. Create one ACM function and configuration, then bind it to the discovered controller. Use fixed diagnostic strings, not the phone's serial number. VID/PID `1d6b:0104` are conventional Linux diagnostic gadget defaults, not IDs assigned for a shipping product.
-7. Derive `/dev/ttyGS0`'s device numbers from sysfs, then restart `getty -L -n -l /bin/sh` whenever the shell exits. No guessed tty major or Android adbd/FunctionFS is used.
+6. Create one ACM function and configuration. Explicitly request the **device role** through `/sys/class/usb_role/*/role` (value `device`) before binding: source-audited mtu3 starts dual-role OTG in host mode and a configfs bind alone does not enable device mode. The role switch is matched to the UDC by physical parent-device path rather than names; the write is asynchronous under mtu3, so the readback is polled with bounded timeouts. A missing, ambiguous or non-switchable role aborts USB setup with console fallback.
+7. Bind the ACM configuration to the discovered controller only after the device role is confirmed. Use fixed diagnostic strings, not the phone's serial number. VID/PID `1d6b:0104` are conventional Linux diagnostic gadget defaults, not IDs assigned for a shipping product. Later Type-C events may still change the role: this is a bounded research initialization, not a Type-C/PD policy.
+8. Derive `/dev/ttyGS0`'s device numbers from sysfs, then restart `getty -L -n -l /bin/sh` whenever the shell exits. No guessed tty major or Android adbd/FunctionFS is used.
 
 The shell has **no password** and full root privileges in this minimal system. It is for short, supervised, physically local research, not an unattended network service. The script does not mount or write phone block storage; a root shell is not a sandbox and must not be mistaken for a data-protection guarantee. A configfs bind log is not proof that a host enumerated or opened the device.
 
@@ -81,7 +82,7 @@ Declared module dependencies do not capture all DT, power-domain, nvmem, firmwar
 
 ## Host validation
 
-- **64 unit tests pass**. Cases cover exact header-page preservation, raw ramdisk offsets/alignment, wrong image types, oversize payloads, dependency order/deduplication/cycles, missing metadata, unsafe paths, excluded watchdog dependencies, atomic output replacement without following a symlink into restore data, the host module inventory tool, generated module-artifact contracts and loader rejection of missing/empty/blank/nameless plans.
+- **91 unit tests pass**. Cases cover exact header-page preservation, raw ramdisk offsets/alignment, wrong image types, oversize payloads, dependency order/deduplication/cycles, missing metadata, unsafe paths, excluded watchdog dependencies, atomic output replacement without following a symlink into restore data, the host module inventory tool, generated module-artifact contracts, loader rejection of missing/empty/blank/nameless plans, and USB role-switch selection/write/readback scenarios executed by the pinned ARM64 BusyBox.
 - Both PID 1 scripts pass host `sh -n`; both also pass the actual pinned ARM64 BusyBox ash parser.
 - The USB init refuses a missing, unreadable or empty module plan and counts blank or nameless entries as load failures instead of continuing without modules; the tty device-number parser rejects extra colons.
 - With real local inputs, an ARM64 BusyBox run under QEMU verifies the emitted `modules.sha256` listing against the staged PLATFORM files extracted from the pinned vendor_boot.
