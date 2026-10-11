@@ -238,22 +238,21 @@ while :; do
 done
 '''
 WIFI = '''#!/sbin/openrc-run
-description="Experimental Wi-Fi (opt-in only)"
-depend() { need dev; after rodin-thermal; }
+description="Wi-Fi hardware power-on (association is NetworkManager's job)"
+depend() { need dev; after rodin-thermal; before networkmanager; }
 start() {
+    ebegin "Powering on Wi-Fi"
     while read -r module rest; do
         case "$module" in ''|\\#*) continue;; esac
-        modprobe "$module" || return 1
+        modprobe "$module" || { eend 1 "modprobe $module failed"; return 1; }
     done < /etc/rodin/wifi-modules.list
-    if [ -x /etc/rodin/wifi-poweron.sh ]; then
-        /etc/rodin/wifi-poweron.sh || return 1
-    fi
-    wpa_supplicant -B -D nl80211 -i wlan0 -c /etc/wpa_supplicant/wpa_supplicant.conf -P /run/rodin-wpa.pid || return 1
-    udhcpc -i wlan0 -b -p /run/rodin-udhcpc.pid
+    /etc/rodin/wifi-poweron.sh
+    eend $?
 }
 stop() {
-    start-stop-daemon --stop --pidfile /run/rodin-udhcpc.pid
-    start-stop-daemon --stop --pidfile /run/rodin-wpa.pid
+    ebegin "Powering off Wi-Fi"
+    [ -c /dev/wmtWifi ] && echo 0 > /dev/wmtWifi
+    eend 0
 }
 '''
 WIFI_POWERON = '''#!/bin/sh
@@ -323,6 +322,18 @@ user = "greetd"
 command = "/usr/local/bin/rodin-phosh-session"
 user = "marinadec"
 '''
+NM_CONF = '''[main]
+plugins=keyfile
+dhcp=internal
+
+[keyfile]
+# usb0 is configured by rodin-usbnet; the others are modem/virtual interfaces.
+unmanaged-devices=interface-name:usb0;interface-name:ccmni*;interface-name:p2p*;interface-name:dummy*;interface-name:ifb*;interface-name:*tnl*;interface-name:*gre*;interface-name:sit*;interface-name:ip_vti*;interface-name:ip6_vti*;interface-name:erspan*
+
+[device]
+wifi.backend=wpa_supplicant
+wifi.scan-rand-mac-address=no
+'''
 FILES = {
     '/etc/inittab': INITTAB,
     '/etc/hostname': 'rodin\n',
@@ -335,6 +346,8 @@ FILES = {
     # No CONFIG_VT: a VT-bound seat never becomes active.
     '/etc/conf.d/seatd': 'export SEATD_VTBOUND=0\n',
     '/etc/greetd/config.toml': GREETD_CONFIG,
+    '/etc/NetworkManager/conf.d/rodin.conf': NM_CONF,
+    '/etc/conf.d/networkmanager': 'rc_after="rodin-wifi"\n',
     '/etc/conf.d/greetd': 'rc_need="dbus elogind"\nrc_after="rodin-touch"\n',
     '/etc/apk/repositories': 'https://mirrors.dotsrc.org/alpine/v3.23/main\nhttps://mirrors.dotsrc.org/alpine/v3.23/community\n',
     '/etc/udhcpd.conf': 'start 172.16.42.2\nend 172.16.42.2\ninterface usb0\nmax_leases 1\nlease_file /var/lib/udhcpd/leases\npidfile /run/udhcpd.pid\noption subnet 255.255.255.0\n',
@@ -382,7 +395,7 @@ SCRIPTS = {
 RUNLEVELS = {
     'sysinit': ['procfs', 'sysfs', 'rodin-dev', 'syslog', 'klogd'],
     'boot': ['rodin-thermal', 'hostname', 'bootmisc', 'localmount', 'sysctl'],
-    'default': ['rodin-usbnet', 'sshd', 'rodin-touch', 'dbus', 'elogind', 'greetd'],
+    'default': ['rodin-usbnet', 'sshd', 'rodin-touch', 'dbus', 'elogind', 'greetd', 'rodin-wifi', 'networkmanager'],
     'shutdown': ['killprocs', 'mount-ro'],
 }
 

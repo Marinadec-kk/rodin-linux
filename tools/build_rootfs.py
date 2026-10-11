@@ -26,7 +26,7 @@ REPO = Path(__file__).resolve().parents[1]
 DL = REPO / 'build/rootfs-dl'
 OUT = REPO / 'build/rootfs'
 ROOT = OUT / 'root'
-PACKAGES = 'alpine-base openrc busybox-mdev-openrc openssh wpa_supplicant iw wireless-regdb kmod e2fsprogs e2fsprogs-extra util-linux-misc doas ca-certificates tzdata nano htop iproute2 bash procps-ng ethtool busybox-extras seatd eudev dbus elogind polkit-elogind greetd greetd-agreety greetd-openrc phosh phoc squeekboard gnome-console font-cantarell adwaita-icon-theme'.split()
+PACKAGES = 'alpine-base openrc busybox-mdev-openrc openssh wpa_supplicant iw wireless-regdb kmod e2fsprogs e2fsprogs-extra util-linux-misc doas ca-certificates tzdata nano htop iproute2 bash procps-ng ethtool busybox-extras seatd eudev dbus elogind polkit-elogind greetd greetd-agreety greetd-openrc phosh phoc squeekboard gnome-console font-cantarell adwaita-icon-theme networkmanager networkmanager-wifi networkmanager-openrc networkmanager-cli'.split()
 
 
 def run(*args, **kwargs):

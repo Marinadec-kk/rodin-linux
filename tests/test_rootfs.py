@@ -82,7 +82,8 @@ class RootfsTests(unittest.TestCase):
         self.assertNotRegex(config.INITTAB, r'tty[1-6]')
         # Bring-up: root shell on ttyGS0 is spawned before OpenRC so a stuck boot stays debuggable.
         self.assertLess(config.INITTAB.index('ttyGS0'), config.INITTAB.index('openrc sysinit'))
-        self.assertNotIn('rodin-wifi', sum(config.RUNLEVELS.values(), []))
+        # Wi-Fi hardware power-on is enabled; NetworkManager owns association.
+        self.assertIn('rodin-wifi', config.RUNLEVELS['default'])
         self.assertIn('rodin-thermal', config.RUNLEVELS['boot'])
         self.assertIn('provide dev dev-mount', config.DEV)
         self.assertNotIn('devtmpfs /dev', config.DEV)
