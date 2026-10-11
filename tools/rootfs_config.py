@@ -1,8 +1,9 @@
 """Configuration payloads for the host rootfs builder."""
-INITTAB = '''::sysinit:/sbin/openrc sysinit
+INITTAB = '''# BRING-UP ONLY: unauthenticated root shell on the USB console before OpenRC runs.
+::sysinit:/bin/sh -c "/bin/busybox setsid /sbin/getty -n -l /bin/sh 115200 ttyGS0 vt100 &"
+::sysinit:/sbin/openrc sysinit
 ::sysinit:/sbin/openrc boot
 ::wait:/sbin/openrc default
-ttyGS0::respawn:/sbin/getty -L 115200 ttyGS0 vt100
 ::ctrlaltdel:/sbin/reboot
 ::shutdown:/sbin/openrc shutdown
 '''
@@ -28,19 +29,24 @@ depend() {
     before localmount bootmisc rodin-thermal sshd
 }
 start() {
-    mount -t tmpfs -o mode=0755,size=10M,nosuid tmpfs /dev || return 1
+    # Stage 1 normally hands over a populated tmpfs /dev; only mount one if it did not.
+    if ! mountpoint -q /dev; then
+        mount -t tmpfs -o mode=0755,size=10M,nosuid tmpfs /dev || return 1
+    fi
     mkdir -p /dev/pts /dev/shm
-    mount -t devpts -o gid=5,mode=0620,nosuid,noexec devpts /dev/pts || return 1
-    mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /dev/shm || return 1
-    mknod -m 600 /dev/console c 5 1
-    mknod -m 666 /dev/null c 1 3
-    mknod -m 666 /dev/tty c 5 0
-    ln -s /proc/self/fd /dev/fd
-    ln -s /proc/self/fd/0 /dev/stdin
-    ln -s /proc/self/fd/1 /dev/stdout
-    ln -s /proc/self/fd/2 /dev/stderr
-    echo /sbin/mdev > /proc/sys/kernel/hotplug || return 1
+    mountpoint -q /dev/pts || mount -t devpts -o gid=5,mode=0620,nosuid,noexec devpts /dev/pts || return 1
+    mountpoint -q /dev/shm || mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /dev/shm || return 1
+    [ -c /dev/console ] || mknod -m 600 /dev/console c 5 1
+    [ -c /dev/null ] || { rm -f /dev/null; mknod -m 666 /dev/null c 1 3; }
+    [ -c /dev/tty ] || mknod -m 666 /dev/tty c 5 0
+    ln -sfn /proc/self/fd /dev/fd
+    ln -sf /proc/self/fd/0 /dev/stdin
+    ln -sf /proc/self/fd/1 /dev/stdout
+    ln -sf /proc/self/fd/2 /dev/stderr
     /sbin/mdev -s
+    # No CONFIG_UEVENT_HELPER (no /proc/sys/kernel/hotplug): listen on netlink instead.
+    start-stop-daemon --start --background --make-pidfile --pidfile /run/rodin-mdev.pid \
+        --exec /sbin/mdev -- -d -f || ewarn "mdev netlink daemon not started"
 }
 '''
 USBNET = '''#!/sbin/openrc-run

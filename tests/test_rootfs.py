@@ -80,7 +80,8 @@ class RootfsTests(unittest.TestCase):
 
     def test_config(self):
         self.assertNotRegex(config.INITTAB, r'tty[1-6]')
-        self.assertIn('ttyGS0::respawn:/sbin/getty -L 115200', config.INITTAB)
+        # Bring-up: root shell on ttyGS0 is spawned before OpenRC so a stuck boot stays debuggable.
+        self.assertLess(config.INITTAB.index('ttyGS0'), config.INITTAB.index('openrc sysinit'))
         self.assertNotIn('rodin-wifi', sum(config.RUNLEVELS.values(), []))
         self.assertIn('rodin-thermal', config.RUNLEVELS['boot'])
         self.assertIn('provide dev dev-mount', config.DEV)

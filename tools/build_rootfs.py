@@ -199,6 +199,11 @@ def configure(inputs):
         put(path, text)
     for path, text in SCRIPTS.items():
         put(path, text, 0o755)
+    # Boot log on disk: the only record when no console is attached.
+    rc_conf = ROOT / 'etc/rc.conf'
+    text = rc_conf.read_text()
+    if 'rc_logger="YES"' not in text:
+        rc_conf.write_text(text + '\n# rodin: keep an OpenRC boot log\nrc_logger="YES"\nrc_log_path="/var/log/rc.log"\n')
     # rc_need adds dependencies; it does not override the service's depend() function.
     for name, old, new in [('localmount', 'need fsck root', 'need dev'), ('syslog', 'need clock hostname localmount', 'need dev hostname localmount'), ('klogd', 'need clock hostname localmount logger', 'need dev hostname localmount logger')]:
         path = ROOT / 'etc/init.d' / name
