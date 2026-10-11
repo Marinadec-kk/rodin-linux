@@ -14,6 +14,12 @@ BAT_HIGH=45
 BAT_LOW=42
 BAT_CRITICAL=55
 INTERVAL=5
+# Available-frequency entries to lower on each hot sample.
+STEP_DOWN=2
+# Available-frequency entries to raise on each cool sample.
+STEP_UP=1
+# Linear steps between cpuinfo_min_freq and the ceiling when no table is available.
+STEP_COUNT=8
 # Consecutive critical readings before poweroff (one bogus sample must not loop).
 CRITICAL_COUNT=3
 # Boot-time cap on every cpufreq policy until the policy is validated on hardware.
@@ -59,6 +65,10 @@ start() {
     fi
     ip link set usb0 up || return 1
     ip addr replace 172.16.42.1/24 dev usb0 || return 1
+    # Internet through the host when it shares its connection (NM "shared");
+    # high metric so Wi-Fi (udhcpc, metric 0) wins whenever it is up.
+    ip route replace default via 172.16.42.2 dev usb0 metric 1000 2>/dev/null || :
+    [ -s /etc/resolv.conf ] || echo 'nameserver 172.16.42.2' > /etc/resolv.conf
     mkdir -p /var/lib/udhcpd
     start-stop-daemon --start --background --make-pidfile --pidfile /run/rodin-udhcpd.pid \
         --exec /usr/sbin/udhcpd -- -f /etc/udhcpd.conf
@@ -96,7 +106,7 @@ for policy in /sys/devices/system/cpu/cpufreq/policy*; do
     case "$top" in
         ''|*[!0-9]*) ;;
         *)
-            cap=$((top / 100 * ${MAX_FREQ_PERCENT:-100}))
+            cap=$((top * ${MAX_FREQ_PERCENT:-100} / 100))
             best=
             for frequency in $(cat "$policy/scaling_available_frequencies" 2>/dev/null); do
                 case "$frequency" in ''|*[!0-9]*) continue;; esac
@@ -109,34 +119,51 @@ for policy in /sys/devices/system/cpu/cpufreq/policy*; do
     esac
     # The restore target is the boot cap, not the hardware maximum.
     cat "$policy/scaling_max_freq" > "$state/$name.max" 2>/dev/null
+    # Cache the sorted table once; cpufreq tables do not change between samples.
+    awk '{ for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+$/ && $i > 0) print $i }' \
+        "$policy/scaling_available_frequencies" 2>/dev/null | sort -nu > "$state/$name.freqs"
 done
 if [ -n "${BACKLIGHT:-}" ]; then
     for led in /sys/class/leds/lcd-backlight/brightness; do
         [ -w "$led" ] && echo "$BACKLIGHT" > "$led"
     done
 fi
-throttled=no
+sensors_missing=no
 critical_seen=0
 while :; do
     hot=no
     cool=yes
     critical=no
     readable=0
+    hottest=0
+    battery=0
     for sensor in /sys/class/thermal/thermal_zone*/temp /sys/class/power_supply/battery/temp; do
         [ -r "$sensor" ] || continue
-        value=$(cat "$sensor" 2>/dev/null) || continue
+        value=
+        read -r value < "$sensor" 2>/dev/null || :
         case "$value" in ''|*[!0-9]*) continue;; esac
         readable=$((readable + 1))
         case "$sensor" in
-            */battery/temp) value=$((value * 100)); high=$((BAT_HIGH * 1000)); low=$((BAT_LOW * 1000)); limit=$((BAT_CRITICAL * 1000));;
+            */battery/temp) value=$((value * 100)); battery=$value
+               high=$((BAT_HIGH * 1000)); low=$((BAT_LOW * 1000)); limit=$((BAT_CRITICAL * 1000));;
             *) [ "$value" -gt 1000 ] || value=$((value * 1000))
+               [ "$value" -le "$hottest" ] || hottest=$value
                high=$((SOC_HIGH * 1000)); low=$((SOC_LOW * 1000)); limit=$((SOC_CRITICAL * 1000));;
         esac
         [ "$value" -le "$high" ] || hot=yes
         [ "$value" -lt "$low" ] || cool=no
         [ "$value" -le "$limit" ] || critical=yes
     done
-    [ "$readable" -gt 0 ] || cool=no
+    if [ "$readable" -eq 0 ]; then
+        hot=yes
+        cool=no
+        if [ "$sensors_missing" = no ]; then
+            logger -t rodin-thermal "No readable temperature sensors; stepping down"
+        fi
+        sensors_missing=yes
+    else
+        sensors_missing=no
+    fi
     if [ "$critical" = yes ]; then
         critical_seen=$((critical_seen + 1))
         logger -t rodin-thermal "critical temperature reading $critical_seen/${CRITICAL_COUNT:-3}"
@@ -147,28 +174,56 @@ while :; do
     else
         critical_seen=0
     fi
-    if [ "$hot" = yes ] && [ "$throttled" = no ]; then
-        logger -t rodin-thermal "High temperature; limiting CPU frequencies"
-        for policy in /sys/devices/system/cpu/cpufreq/policy*; do
-            [ -d "$policy" ] || continue
-            minimum=
-            for frequency in $(cat "$policy/scaling_available_frequencies" 2>/dev/null); do
-                case "$frequency" in ''|*[!0-9]*) continue;; esac
-                if [ -z "$minimum" ] || [ "$frequency" -lt "$minimum" ]; then minimum=$frequency; fi
-            done
-            [ -n "$minimum" ] || minimum=$(cat "$policy/cpuinfo_min_freq" 2>/dev/null)
-            case "$minimum" in ''|*[!0-9]*) continue;; esac
-            echo "$minimum" > "$policy/scaling_max_freq" 2>/dev/null || logger -t rodin-thermal "Cannot throttle $policy"
-        done
-        throttled=yes
-    elif [ "$cool" = yes ] && [ "$throttled" = yes ]; then
-        logger -t rodin-thermal "Temperature recovered; restoring CPU limits"
+    direction=hold
+    if [ "$hot" = yes ]; then
+        direction=down
+        steps=${STEP_DOWN:-2}
+    elif [ "$cool" = yes ]; then
+        direction=up
+        steps=${STEP_UP:-1}
+    fi
+    if [ "$direction" != hold ]; then
         for policy in /sys/devices/system/cpu/cpufreq/policy*; do
             [ -d "$policy" ] || continue
             name=${policy##*/}
-            cat "$state/$name.max" > "$policy/scaling_max_freq" 2>/dev/null || :
+            old=
+            ceiling=
+            read -r old < "$policy/scaling_max_freq" 2>/dev/null || :
+            read -r ceiling < "$state/$name.max" 2>/dev/null || :
+            case "$old:$ceiling" in *[!0-9:]*|:*|*:) continue;; esac
+            if [ -s "$state/$name.freqs" ]; then
+                new=$(awk -v old="$old" -v ceiling="$ceiling" \
+                    -v direction="$direction" -v steps="$steps" '
+                    { f[NR]=$1; if ($1 <= old) pos=NR }
+                    END {
+                        if (!pos) pos=1
+                        if (direction == "down") pos-=steps; else pos+=steps
+                        if (pos < 1) pos=1
+                        if (pos > NR) pos=NR
+                        value=f[pos]
+                        if (value > ceiling) value=ceiling
+                        print value
+                    }' "$state/$name.freqs") || continue
+            else
+                minimum=
+                read -r minimum < "$policy/cpuinfo_min_freq" 2>/dev/null || :
+                case "$minimum" in ''|*[!0-9]*) continue;; esac
+                stride=$(((ceiling - minimum) / ${STEP_COUNT:-8}))
+                [ "$stride" -gt 0 ] || stride=1
+                if [ "$direction" = down ]; then
+                    new=$((old - stride * steps))
+                else
+                    new=$((old + stride * steps))
+                fi
+                [ "$new" -ge "$minimum" ] || new=$minimum
+                [ "$new" -le "$ceiling" ] || new=$ceiling
+            fi
+            if [ "$new" != "$old" ]; then
+                if echo "$new" > "$policy/scaling_max_freq" 2>/dev/null; then
+                    logger -t rodin-thermal "$name $old->$new kHz; SoC=$hottest battery=$battery mC readable=$readable"
+                fi
+            fi
         done
-        throttled=no
     fi
     sleep "$INTERVAL"
 done

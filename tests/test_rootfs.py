@@ -106,6 +106,139 @@ class RootfsTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
                     builder.prepare()
 
+    def run_thermal_steps(self, samples, *, available=True, tunables=''):
+        """Fake sleep advances sensor snapshots and records both policy limits."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policies = []
+            for index, multiplier in enumerate((1, 2)):
+                policy = root / f'sys/devices/system/cpu/cpufreq/policy{index}'
+                policy.mkdir(parents=True)
+                values = {'scaling_max_freq': str(2000 * multiplier),
+                          'scaling_governor': 'performance',
+                          'cpuinfo_min_freq': str(200 * multiplier),
+                          'cpuinfo_max_freq': str(2000 * multiplier)}
+                if available:
+                    values['scaling_available_frequencies'] = ' '.join(
+                        str(f * multiplier) for f in (2000, 600, 200, 1400, 400, 1000, 800, 1200, 1600, 600)) + ' bogus'
+                for name, value in values.items():
+                    (policy / name).write_text(value)
+                policies.append(policy)
+            sensors = [root / 'sys/class/thermal/thermal_zone0/temp',
+                       root / 'sys/class/thermal/thermal_zone1/temp',
+                       root / 'sys/class/power_supply/battery/temp']
+            for sensor in sensors:
+                sensor.parent.mkdir(parents=True, exist_ok=True)
+
+            def set_sample(sample):
+                return '; '.join(f'rm -f "{sensor}"' if value is None else
+                                 f'printf "%s" "{value}" > "{sensor}"'
+                                 for sensor, value in zip(sensors, sample))
+
+            conf = root / 'etc/conf.d/rodin-thermal'
+            conf.parent.mkdir(parents=True)
+            conf.write_text(config.THERMAL_CONF + tunables)
+            backlight = root / 'sys/class/leds/lcd-backlight/brightness'
+            backlight.parent.mkdir(parents=True)
+            backlight.write_text('100')
+            text = config.THERMALD
+            for prefix in ['/etc', '/run', '/sys']:
+                text = text.replace(prefix + '/', str(root) + prefix + '/')
+            text = text.replace('/sbin/poweroff', 'fake_poweroff')
+            cases = '\n'.join(f'{i}) {set_sample(sample)};;'
+                              for i, sample in enumerate(samples[1:], 1))
+            record = '\n'.join(f'cat "{policy}/scaling_max_freq" >> "{root}/limits{i}"'
+                               for i, policy in enumerate(policies))
+            harness = f'''count=0
+logger() {{ echo "$*" >> "{root}/log"; }}
+fake_poweroff() {{ echo shutdown >> "{root}/log"; exit 0; }}
+sleep() {{
+    count=$((count + 1))
+    {record}
+    case "$count" in
+        {cases}
+        *) exit 99;;
+    esac
+}}
+{set_sample(samples[0])}
+'''
+            result = subprocess.run(['sh'], input=harness + text, text=True,
+                                    capture_output=True, timeout=10)
+            self.assertIn(result.returncode, (0, 99), result.stderr)
+            self.assertEqual(result.stderr, '')
+            for policy, ceiling in zip(policies, (1400, 2800)):
+                self.assertEqual((policy / 'scaling_governor').read_text().strip(), 'schedutil')
+                self.assertEqual((root / f'run/rodin-thermal/{policy.name}.max').read_text().strip(), str(ceiling))
+            self.assertEqual(backlight.read_text().strip(), '0')
+            limits = [[int(v) for v in (root / f'limits{i}').read_text().splitlines()]
+                      for i in range(2)]
+            log = (root / 'log').read_text() if (root / 'log').exists() else ''
+            return limits, log, result.returncode
+
+    def test_thermal_gradual_step_down_to_floor(self):
+        limits, log, code = self.run_thermal_steps([('70001', '50000', '400')] * 5)
+        self.assertEqual(limits, [[1000, 600, 200, 200, 200], [2000, 1200, 400, 400, 400]])
+        self.assertEqual(log.count('kHz;'), 6)
+        self.assertIn('policy0 1400->1000 kHz; SoC=70001 battery=40000', log)
+        self.assertEqual(code, 99)
+
+    def test_thermal_step_up_to_ceiling(self):
+        limits, log, _ = self.run_thermal_steps(
+            [('50000', '75000', '400')] * 3 + [('59', '50000', '400')] * 8)
+        self.assertEqual(limits[0], [1000, 600, 200, 400, 600, 800, 1000, 1200, 1400, 1400, 1400])
+        self.assertEqual(limits[1], [v * 2 for v in limits[0]])
+        self.assertEqual(log.count('kHz;'), 18)
+
+    def test_thermal_hold_band_and_threshold_boundaries(self):
+        limits, log, _ = self.run_thermal_steps([
+            ('75000', '50000', '400'), ('65000', '50000', '400'),
+            ('60000', '50000', '400'), ('70000', '50000', '400'),
+            ('59000', '50000', '420'), ('59000', '50000', '450')])
+        self.assertEqual(limits[0], [1000] * 6)
+        self.assertEqual(log.count('kHz;'), 2)
+
+    def test_thermal_missing_frequency_table_fallback(self):
+        # Ceiling 1400, minimum 200: default stride = 1200 / 8 = 150.
+        limits, _, _ = self.run_thermal_steps(
+            [('75000', None, '400')] * 5 + [('50000', None, '400')] * 10,
+            available=False)
+        self.assertEqual(limits[0], [1100, 800, 500, 200, 200,
+                                    350, 500, 650, 800, 950, 1100, 1250, 1400, 1400, 1400])
+        self.assertEqual(limits[1], [v * 2 for v in limits[0]])
+
+    def test_thermal_no_readable_sensors_steps_down(self):
+        limits, log, _ = self.run_thermal_steps(
+            [(None, 'bogus', None)] * 5 + [('50000', None, None), (None, None, None)])
+        self.assertEqual(limits[0], [1000, 600, 200, 200, 200, 400, 200])
+        self.assertEqual(log.count('No readable temperature sensors'), 2)
+        self.assertEqual(log.count('kHz;'), 10)
+
+    def test_thermal_battery_thresholds(self):
+        limits, _, _ = self.run_thermal_steps([
+            ('50000', None, '451'), ('50000', None, '430'),
+            ('50000', None, '419')])
+        self.assertEqual(limits[0], [1000, 1000, 1200])
+
+    def test_thermal_critical_counter_resets(self):
+        _, log, code = self.run_thermal_steps([
+            ('91000', None, None), ('50000', None, None),
+            ('91000', None, None), ('91000', None, None),
+            ('bogus', None, None)] + [('91', None, None)] * 3)
+        self.assertEqual(code, 0)
+        self.assertEqual(log.count('critical temperature reading 1/3'), 3)
+        self.assertIn('critical temperature reading 3/3', log)
+        self.assertIn('shutdown', log)
+
+    def test_thermal_custom_steps(self):
+        limits, _, _ = self.run_thermal_steps(
+            [('75000', None, None), ('50000', None, None)],
+            tunables='STEP_DOWN=1\nSTEP_UP=2\n')
+        self.assertEqual(limits[0], [1200, 1400])
+        limits, _, _ = self.run_thermal_steps(
+            [('75000', None, None), ('50000', None, None)], available=False,
+            tunables='STEP_DOWN=1\nSTEP_UP=1\nSTEP_COUNT=4\n')
+        self.assertEqual(limits[0], [1100, 1400])
+
     def test_thermal_hysteresis_and_critical_shutdown(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -143,10 +276,9 @@ sleep() {{
 }}
 '''
             subprocess.run(['sh'], input=harness + text, text=True, check=True, timeout=10)
-            # Boot cap 70 % of 2000 → 1400; throttle to 500; restore to the cap; a critical
-            # reading also throttles, and it takes three
-            # consecutive critical readings before poweroff.
-            self.assertEqual((root / 'limits').read_text().splitlines(), ['500', '500', '500', '1400', '500', '500'])
+            # Boot cap 1400; two entries down reaches 500. Cooling raises only
+            # one entry to 1000; critical shutdown still needs three samples.
+            self.assertEqual((root / 'limits').read_text().splitlines(), ['500', '500', '500', '1000', '500', '500'])
             self.assertEqual((root / 'log').read_text().count('critical temperature reading'), 3)
             self.assertEqual((policy / 'scaling_governor').read_text().strip(), 'schedutil')
             self.assertIn('shutdown', (root / 'log').read_text())
