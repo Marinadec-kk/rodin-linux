@@ -334,6 +334,44 @@ unmanaged-devices=interface-name:usb0;interface-name:ccmni*;interface-name:p2p*;
 wifi.backend=wpa_supplicant
 wifi.scan-rand-mac-address=no
 '''
+PANEL_HOOK = r'''#!/bin/sh
+# React to panel power-on. Blanking makes the kernel set the backlight to 0
+# directly (sysfs keeps the old value) and nothing restores it, because Phosh
+# drives /sys/class/backlight and this panel only has leds/lcd-backlight.
+# Trigger: the Xiaomi touch notifier's "touchpanel resume" line in /dev/kmsg.
+led=/sys/class/leds/lcd-backlight/brightness
+start_us=$(awk '{printf "%d", $1 * 1000000}' /proc/uptime)
+restore_backlight() {
+    level=$(cat "$led" 2>/dev/null)
+    case "$level" in ''|*[!0-9]*|0) level=3000 ;; esac
+    # Writing the unchanged value is ignored by the driver; force a real update.
+    echo $((level - 1)) > "$led"
+    echo "$level" > "$led"
+}
+# read fails with EPIPE when the kernel ring overwrites unread records: reopen.
+while :; do
+while IFS= read -r line; do
+    case "$line" in
+        *"touchpanel resume"*) ;;
+        *) continue ;;
+    esac
+    stamp=$(echo "$line" | cut -d, -f3)
+    case "$stamp" in ''|*[!0-9]*) continue ;; esac
+    [ "$stamp" -ge "$start_us" ] || continue
+    sleep 0.3
+    restore_backlight
+    [ -x /etc/rodin/panel-on.d/touch ] && /etc/rodin/panel-on.d/touch
+done < /dev/kmsg
+sleep 1
+done
+'''
+PANEL_HOOK_INIT = r'''#!/sbin/openrc-run
+description="Restore backlight (and touch mode) when the panel powers on"
+command=/usr/local/sbin/rodin-panel-hook
+command_background=yes
+pidfile=/run/rodin-panel-hook.pid
+depend() { need dev; before greetd; }
+'''
 FILES = {
     '/etc/inittab': INITTAB,
     '/etc/hostname': 'rodin\n',
@@ -388,6 +426,8 @@ SCRIPTS = {
     '/etc/init.d/rodin-thermal': THERMAL_SERVICE,
     '/etc/init.d/rodin-wifi': WIFI,
     '/etc/init.d/rodin-touch': TOUCH,
+    '/usr/local/sbin/rodin-panel-hook': PANEL_HOOK,
+    '/etc/init.d/rodin-panel-hook': PANEL_HOOK_INIT,
     '/usr/local/bin/rodin-phosh-session': PHOSH_SESSION,
     '/usr/local/sbin/rodin-thermald': THERMALD,
     '/etc/rodin/wifi-poweron.sh': WIFI_POWERON,
@@ -395,7 +435,7 @@ SCRIPTS = {
 RUNLEVELS = {
     'sysinit': ['procfs', 'sysfs', 'rodin-dev', 'syslog', 'klogd'],
     'boot': ['rodin-thermal', 'hostname', 'bootmisc', 'localmount', 'sysctl'],
-    'default': ['rodin-usbnet', 'sshd', 'rodin-touch', 'dbus', 'elogind', 'greetd', 'rodin-wifi', 'networkmanager'],
+    'default': ['rodin-usbnet', 'sshd', 'rodin-touch', 'dbus', 'elogind', 'greetd', 'rodin-wifi', 'networkmanager', 'rodin-panel-hook'],
     'shutdown': ['killprocs', 'mount-ro'],
 }
 
