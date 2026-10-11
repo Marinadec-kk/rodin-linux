@@ -5,9 +5,11 @@ The PTY probe tests ARM getty -> native host launcher -> ARM interactive shell.
 It does NOT emulate the phone kernel, module loading, configfs or physical USB.
 """
 import argparse
+import hashlib
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import shlex
 import subprocess
@@ -15,6 +17,7 @@ import tempfile
 import time
 
 import build_initramfs as ramfs
+import build_candidate as candidate
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED = {"ash", "sh", "mount", "insmod", "sha256sum", "setsid", "getty", "mknod", "sleep", "mkdir", "ln"}
@@ -62,10 +65,74 @@ def pty_probe(qemu, binary, work):
         os.close(slave)
 
 
+def checksum_probe(command, listing, expected_success):
+    result = subprocess.run(command + ["sha256sum", "-c", str(listing)], capture_output=True)
+    if (result.returncode == 0) != expected_success:
+        raise ValueError("Unexpected ARM sha256sum result: " + repr(result))
+
+
+def characterize(command, work):
+    payload = work / "checksum-payload"
+    payload.write_bytes(b"ARM checksum fixture\n")
+    listing = work / "checksums"
+    digest = hashlib.sha256(payload.read_bytes()).hexdigest()
+    for checksum, path, success in ((digest, payload, True), ("0" * 64, payload, False),
+                                    (digest, work / "absent", False)):
+        listing.write_text(f"{checksum}  {path}\n")
+        checksum_probe(command, listing, success)
+    result = subprocess.check_output(command + ["ash", "-c",
+        'while read -r module name; do printf "<%s>|<%s>\\n" "$module" "$name"; done'],
+        input=b"\n/path\n/path name extra\n/path name\r\n")
+    if result != b"<>|<>\n</path>|<>\n</path>|<name extra>\n</path>|<name\r>\n":
+        raise ValueError("Unexpected ARM ash read semantics: " + repr(result))
+    script = (ROOT / "initramfs" / "usb-init").read_text()
+    rule = next(line.strip() for line in script.splitlines() if 'case "$major:$minor"' in line)
+    for value, valid in (("4:1", True), ("123:456", True), ("", False), ("x:y", False),
+                         ("4:", False), (":1", False), ("4:1:", False), ("4:1:2", False)):
+        major, _, minor = value.partition(":")
+        result = subprocess.run(command + ["ash", "-c",
+            'major=$1; minor=$2; validate() { ' + rule + '; }; validate', "probe", major, minor])
+        if (result.returncode == 0) != valid:
+            raise ValueError("Unexpected tty device-number validation: " + repr(value))
+
+
+def module_checksum_probe(command, work, build_dir):
+    vendor = build_dir / "ota" / "vendor_boot.img"
+    listing = build_dir / "candidate" / "modules.sha256"
+    if not vendor.is_file() or not listing.is_file():
+        print("SKIP: module artifact checksum probe (inputs absent)")
+        return False
+    data = vendor.read_bytes()
+    if candidate.digest(data) != candidate.ORIGINAL_HASHES["vendor_boot.img"]:
+        raise ValueError("Original vendor_boot.img hash mismatch")
+    files = candidate.platform_members(data, "lz4")
+    staged = work / "platform"
+    staged.mkdir()
+    checksums = []
+    for line in listing.read_text().splitlines():
+        match = re.fullmatch(r"([0-9a-f]{64})  (/lib/modules/[A-Za-z0-9_-]+\.ko)", line)
+        if not match:
+            raise ValueError("Malformed module checksum entry")
+        digest, path = match.groups()
+        target = staged / path.lstrip("/")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(files[path.lstrip("/")])
+        checksums.append(f"{digest}  {target}\n")
+    if not checksums:
+        raise ValueError("Empty module checksum plan")
+    rewritten = work / "platform.sha256"
+    rewritten.write_text("".join(checksums))
+    checksum_probe(command, rewritten, True)
+    print("PASS: ARM sha256sum parses builder module checksums against PLATFORM files")
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--qemu", type=Path, required=True)
     parser.add_argument("--apk", type=Path, required=True)
+    parser.add_argument("--module-artifacts", type=Path, nargs="?", const=ROOT / "build",
+                        help="Also check ota/vendor_boot.img against candidate/modules.sha256 in this build directory; skip absent inputs")
     args = parser.parse_args()
     qemu = args.qemu.resolve()
     with tempfile.TemporaryDirectory() as temp:
@@ -77,7 +144,11 @@ def main():
         applets = set(subprocess.check_output(command + ["--list"], text=True).splitlines())
         if not REQUIRED <= applets:
             raise ValueError("Missing required BusyBox applets: " + str(REQUIRED - applets))
+        subprocess.run(command + ["ash", "-n", str(ROOT / "initramfs" / "init")], check=True)
         subprocess.run(command + ["ash", "-n", str(ROOT / "initramfs" / "usb-init")], check=True)
+        characterize(command, work)
+        if args.module_artifacts is not None:
+            module_checksum_probe(command, work, args.module_artifacts.resolve())
         refusal = subprocess.run(command + ["ash", str(ROOT / "initramfs" / "usb-init")],
                                  capture_output=True, text=True)
         if refusal.returncode != 1 or "must be PID 1" not in refusal.stderr:
@@ -88,7 +159,7 @@ def main():
         if not (links / "getty").is_symlink() or not (links / "sha256sum").is_symlink():
             raise ValueError("BusyBox applet installation failed")
         pty_probe(qemu, binary, work)
-    print("PASS: ARM64 applets, ash syntax, non-PID-1 refusal, applet installer, getty/shell PTY")
+    print("PASS: ARM64 applets, both ash syntax checks, sha256sum, read semantics, tty number validation, non-PID-1 refusal, applet installer, getty/shell PTY")
     print("NOT TESTED: kernel init, module ABI/probe, ramdisk composition, AVB chain or USB hardware")
 
 

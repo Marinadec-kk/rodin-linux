@@ -34,13 +34,21 @@ log "USB ACM candidate; no Android init, no storage mounts"
 
 load_modules() {
     # Reject wrong ramdisk/module combinations before any module insertion.
+    if [ ! -f /etc/rodin/modules.load ] || [ ! -r /etc/rodin/modules.load ] || [ ! -s /etc/rodin/modules.load ]; then
+        log "module load plan missing, unreadable or empty; USB setup aborted"
+        return 1
+    fi
     if ! bb sha256sum -c /etc/rodin/modules.sha256 >> /run/rodin-bringup.log 2>&1; then
         log "module integrity check failed; USB setup aborted"
         return 1
     fi
     failures=0
     while read -r module name; do
-        [ -n "$module" ] || continue
+        if [ -z "$name" ]; then
+            log "module load entry has no name; USB setup aborted"
+            failures=$((failures + 1))
+            continue
+        fi
         if [ -d "/sys/module/$name" ]; then continue; fi
         if bb insmod "$module" >> /run/rodin-bringup.log 2>&1; then
             log "inserted $name"
@@ -100,7 +108,7 @@ usb_console() {
     [ -r /sys/class/tty/ttyGS0/dev ] || return 1
     IFS=: read -r major minor < /sys/class/tty/ttyGS0/dev
     # Kernel-provided numbers only; do not guess a ttyGS major/minor.
-    case "$major:$minor" in *[!0-9:]*|:*|*:) return 1 ;; esac
+    case "$major:$minor" in *[!0-9:]*|:*|*:|*:*:*) return 1 ;; esac
     bb mknod -m 600 /dev/ttyGS0 c "$major" "$minor" || return 1
     log "ttyGS0 ready; shell has no password (local research only)"
     while :; do

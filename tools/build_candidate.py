@@ -12,6 +12,7 @@ import stat
 import struct
 import subprocess
 import tempfile
+import zlib
 
 import build_initramfs as ramfs
 import inspect_boot
@@ -237,6 +238,7 @@ def main():
         "original_restore_sha256": ORIGINAL_HASHES, "kernel_and_vendor_boot_modified": False,
         "busybox_apk_sha256": ramfs.APK_SHA256, "usb_init_sha256": digest(init),
         "ramdisk_gzip_sha256": digest(compressed), "ramdisk_gzip_size": len(compressed),
+        "zlib_version": zlib.ZLIB_VERSION,
         "avbtool_version": version, "avbtool_file_sha256": digest(Path(avbtool).read_bytes()),
         "avb_algorithm": "NONE (same as original init_boot)", "avb_chain_acceptance": "unproven",
         "ota_kernel_config_sha256": digest(config),
