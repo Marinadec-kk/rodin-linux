@@ -309,18 +309,43 @@ FILES = {
     '/etc/motd': 'EXPERIMENTAL native Linux on rodin. Thermal policy is a safety net only.\nSupervised local use only; wheel has temporary passwordless doas.\n',
     '/etc/rodin/README': 'rodin-dev populates tmpfs /dev with mdev. Stage 1 keeps the watchdog alive.\nrodin-thermal starts in boot; fill thermal-modules.list before hardware use.\nrodin-usbnet offers 172.16.42.2 to the USB host; SSH keys only.\nrodin-wifi is NOT enabled; fill its module list, power hook and network config.\nRoot is already writable: root/fsck services disabled; host fsck validates the image.\nNo hardware validation, suspend or complete thermal management is implied.\n',
 }
+TOUCH = '''#!/sbin/openrc-run
+description="Goodix GT9916 touchscreen (Xiaomi THP driver) handed to the AP"
+depend() { need dev; after rodin-thermal; }
+start() {
+    ebegin "Loading touch drivers"
+    for module in xiaomi_touch_rodin goodix_core_rodin; do
+        modprobe "$module" || { eend 1 "modprobe $module failed"; return 1; }
+    done
+    # Late init (firmware/config check) runs asynchronously after probe.
+    count=0
+    until [ -w /sys/class/touch/touch_dev/touch_doze_analysis ]; do
+        count=$((count + 1))
+        [ "$count" -lt 30 ] || { eend 1 "touch_doze_analysis missing"; return 1; }
+        sleep 1
+    done
+    sleep 2
+    # Without Android's display HAL no panel DPMS-on event follows boot, so the
+    # sensor hub (SCP) keeps the touch bus (scptp_cur_state=2) and no input events
+    # reach /dev/input. "0" = driver suspend+resume cycle: switches the bus to the
+    # AP and resets the IC into touch-data mode.
+    echo 0 > /sys/class/touch/touch_dev/touch_doze_analysis
+    eend $?
+}
+'''
 SCRIPTS = {
     '/etc/init.d/rodin-dev': DEV,
     '/etc/init.d/rodin-usbnet': USBNET,
     '/etc/init.d/rodin-thermal': THERMAL_SERVICE,
     '/etc/init.d/rodin-wifi': WIFI,
+    '/etc/init.d/rodin-touch': TOUCH,
     '/usr/local/sbin/rodin-thermald': THERMALD,
     '/etc/rodin/wifi-poweron.sh': WIFI_POWERON,
 }
 RUNLEVELS = {
     'sysinit': ['procfs', 'sysfs', 'rodin-dev', 'syslog', 'klogd'],
     'boot': ['rodin-thermal', 'hostname', 'bootmisc', 'localmount', 'sysctl'],
-    'default': ['rodin-usbnet', 'sshd'],
+    'default': ['rodin-usbnet', 'sshd', 'rodin-touch'],
     'shutdown': ['killprocs', 'mount-ro'],
 }
 
