@@ -53,6 +53,15 @@ start() {
     # No CONFIG_UEVENT_HELPER (no /proc/sys/kernel/hotplug): listen on netlink instead.
     start-stop-daemon --start --background --make-pidfile --pidfile /run/rodin-mdev.pid \
         --exec /sbin/mdev -- -d -f || ewarn "mdev netlink daemon not started"
+    # mdev creates the nodes; eudev's udevd only provides the property database
+    # (ID_INPUT_* etc.) that libinput needs to accept devices.
+    if [ -x /sbin/udevd ]; then
+        /sbin/udevd --daemon && udevadm trigger --action=add && udevadm settle -t 15 || ewarn "udev property database incomplete"
+    fi
+    # Let the desktop session (group video) set the brightness.
+    for led in /sys/class/leds/*/brightness; do
+        [ -e "$led" ] && chgrp video "$led" && chmod g+w "$led"
+    done
 }
 '''
 USBNET = '''#!/sbin/openrc-run
