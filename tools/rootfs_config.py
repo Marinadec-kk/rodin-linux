@@ -61,7 +61,7 @@ start() {
     ip addr replace 172.16.42.1/24 dev usb0 || return 1
     mkdir -p /var/lib/udhcpd
     start-stop-daemon --start --background --make-pidfile --pidfile /run/rodin-udhcpd.pid \
-        --exec /bin/busybox -- udhcpd -f /etc/udhcpd.conf
+        --exec /usr/sbin/udhcpd -- -f /etc/udhcpd.conf
 }
 stop() {
     start-stop-daemon --stop --pidfile /run/rodin-udhcpd.pid
@@ -184,13 +184,55 @@ start() {
     if [ -x /etc/rodin/wifi-poweron.sh ]; then
         /etc/rodin/wifi-poweron.sh || return 1
     fi
-    wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant/wpa_supplicant.conf -P /run/rodin-wpa.pid || return 1
+    wpa_supplicant -B -D nl80211 -i wlan0 -c /etc/wpa_supplicant/wpa_supplicant.conf -P /run/rodin-wpa.pid || return 1
     udhcpc -i wlan0 -b -p /run/rodin-udhcpc.pid
 }
 stop() {
     start-stop-daemon --stop --pidfile /run/rodin-udhcpc.pid
     start-stop-daemon --stop --pidfile /run/rodin-wpa.pid
 }
+'''
+WIFI_POWERON = '''#!/bin/sh
+# Wi-Fi power-on as validated on hardware 2026-10-11. The Wi-Fi RAM code is
+# preloaded by LK; the kernel side needs (1) the calibration NVRAM pushed through
+# /dev/wmtWifi ("WR-BUF:NVRAM" + data in ONE write) so gen4m registers with WMT,
+# (2) conninfra pre-calibration, which only starts once BOTH Wi-Fi and BT
+# (bt_drv_6899) are registered, then (3) "1" written to /dev/wmtWifi.
+set -e
+log() { logger -t rodin-wifi "$*"; echo "rodin-wifi: $*"; }
+nvdev=
+for uevent in /sys/class/block/*/uevent; do
+    grep -qx PARTNAME=nvdata "$uevent" && nvdev=/dev/$(basename "${uevent%/uevent}")
+done
+[ -b "$nvdev" ] || { log "nvdata partition not found"; exit 1; }
+mkdir -p /run/rodin-nvdata
+# noload: never replay the journal; this partition belongs to the modem/factory data.
+mount -o ro,noload "$nvdev" /run/rodin-nvdata
+trap 'umount /run/rodin-nvdata 2>/dev/null || :' EXIT
+{ printf 'WR-BUF:NVRAM'; cat /run/rodin-nvdata/APCFG/APRDEB/WIFI; } > /run/rodin-wifi-nvram.bin
+umount /run/rodin-nvdata
+trap - EXIT
+if [ ! -c /dev/wmtWifi ]; then
+    major=$(awk '$2 == "mtk_wmt_wifi_chrdev" {print $1}' /proc/devices)
+    [ -n "$major" ] || { log "mtk_wmt_wifi_chrdev not registered"; exit 1; }
+    mknod -m 600 /dev/wmtWifi c "$major" 0
+fi
+dd if=/run/rodin-wifi-nvram.bin of=/dev/wmtWifi bs=16384 count=1 2>/dev/null
+rm -f /run/rodin-wifi-nvram.bin
+# Pre-calibration runs asynchronously after the NVRAM push; power-on retries until done.
+attempt=0
+until echo 1 > /dev/wmtWifi 2>/dev/null; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 6 ] || { log "WMT power-on failed"; exit 1; }
+    sleep 5
+done
+count=0
+until [ -e /sys/class/net/wlan0 ]; do
+    count=$((count + 1))
+    [ "$count" -lt 20 ] || { log "wlan0 did not appear"; exit 1; }
+    sleep 1
+done
+log "wlan0 is up"
 '''
 FILES = {
     '/etc/inittab': INITTAB,
@@ -201,6 +243,9 @@ FILES = {
     '/etc/ssh/sshd_config': 'PasswordAuthentication no\nPermitRootLogin no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nSubsystem sftp /usr/lib/ssh/sftp-server\n',
     '/etc/conf.d/sshd': 'rc_need="rodin-thermal dev"\n',
     '/etc/conf.d/rodin-thermal': THERMAL_CONF,
+    # No CONFIG_VT: a VT-bound seat never becomes active.
+    '/etc/conf.d/seatd': 'export SEATD_VTBOUND=0\n',
+    '/etc/apk/repositories': 'https://mirrors.dotsrc.org/alpine/v3.23/main\nhttps://mirrors.dotsrc.org/alpine/v3.23/community\n',
     '/etc/udhcpd.conf': 'start 172.16.42.2\nend 172.16.42.2\ninterface usb0\nmax_leases 1\nlease_file /var/lib/udhcpd/leases\npidfile /run/udhcpd.pid\noption subnet 255.255.255.0\n',
     '/etc/wpa_supplicant/wpa_supplicant.conf': 'ctrl_interface=/run/wpa_supplicant\nupdate_config=1\ncountry=RU\n# Add networks locally; Wi-Fi service is not enabled.\n',
     '/etc/rodin/thermal-modules.list': '# Pending hardware-specific thermal module investigation.\n',
@@ -215,7 +260,7 @@ SCRIPTS = {
     '/etc/init.d/rodin-thermal': THERMAL_SERVICE,
     '/etc/init.d/rodin-wifi': WIFI,
     '/usr/local/sbin/rodin-thermald': THERMALD,
-    '/etc/rodin/wifi-poweron.sh': '#!/bin/sh\n# Placeholder: no power-on sequence has been validated.\nexit 0\n',
+    '/etc/rodin/wifi-poweron.sh': WIFI_POWERON,
 }
 RUNLEVELS = {
     'sysinit': ['procfs', 'sysfs', 'rodin-dev', 'syslog', 'klogd'],

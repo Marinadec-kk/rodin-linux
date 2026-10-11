@@ -19,13 +19,14 @@ import zlib
 sys.dont_write_bytecode = True
 from rootfs_config import SCRIPTS, RUNLEVELS, with_inputs
 
-BASE = 'https://dl-cdn.alpinelinux.org/alpine/v3.23'
+# dl-cdn measured ~230 KB/s from the build host; dotsrc ~8 MB/s (2026-10-11).
+BASE = 'https://mirrors.dotsrc.org/alpine/v3.23'
 RELEASE = '6.6.89-android15-8-g8e4be6b47e40-ab14134548-4k'
 REPO = Path(__file__).resolve().parents[1]
 DL = REPO / 'build/rootfs-dl'
 OUT = REPO / 'build/rootfs'
 ROOT = OUT / 'root'
-PACKAGES = 'alpine-base openrc busybox-mdev-openrc openssh wpa_supplicant iw wireless-regdb kmod e2fsprogs e2fsprogs-extra util-linux-misc doas ca-certificates tzdata nano htop iproute2 bash procps-ng ethtool'.split()
+PACKAGES = 'alpine-base openrc busybox-mdev-openrc openssh wpa_supplicant iw wireless-regdb kmod e2fsprogs e2fsprogs-extra util-linux-misc doas ca-certificates tzdata nano htop iproute2 bash procps-ng ethtool busybox-extras seatd'.split()
 
 
 def run(*args, **kwargs):
