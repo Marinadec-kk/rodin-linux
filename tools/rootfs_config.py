@@ -348,9 +348,10 @@ restore_backlight() {
     echo $((level - 1)) > "$led"
     echo "$level" > "$led"
 }
-# read fails with EPIPE when the kernel ring overwrites unread records: reopen.
+# /dev/kmsg returns whole records only (a 1-byte read, as ash's `read` does,
+# fails with EINVAL), so let cat read it; reopen if it ever exits (EPIPE).
 while :; do
-while IFS= read -r line; do
+cat /dev/kmsg | while IFS= read -r line; do
     case "$line" in
         *"touchpanel resume"*) ;;
         *) continue ;;
@@ -358,10 +359,13 @@ while IFS= read -r line; do
     stamp=$(echo "$line" | cut -d, -f3)
     case "$stamp" in ''|*[!0-9]*) continue ;; esac
     [ "$stamp" -ge "$start_us" ] || continue
-    sleep 0.3
-    restore_backlight
+    # The panel ignores brightness until its first frames are out; retry.
+    for delay in 0.3 0.7 1; do
+        sleep "$delay"
+        restore_backlight
+    done
     [ -x /etc/rodin/panel-on.d/touch ] && /etc/rodin/panel-on.d/touch
-done < /dev/kmsg
+done
 sleep 1
 done
 '''
