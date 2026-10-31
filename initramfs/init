@@ -1,0 +1,23 @@
+#!/bin/sh
+# Research PID 1: no automatic partition mounts, module loads or flash writes.
+export PATH=/bin:/sbin
+export HOME=/root
+export TERM=linux
+umask 077
+
+# Device nodes are shipped in the archive because this GKI lacks DEVTMPFS.
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+/bin/busybox mount -t devpts devpts /dev/pts
+/bin/busybox mount -t tmpfs tmpfs /run
+
+message='rodin research initramfs reached PID 1; storage and USB networking are NOT configured'
+printf '%s\n' "$message" > /dev/kmsg
+printf '\n%s\n' "$message" > /dev/console
+
+# Keep PID 1 alive when a shell exits or when a usable console is unavailable.
+# This is not a demonstrated console on rodin. No USB gadget is configured.
+while :; do
+    /bin/busybox sh -i < /dev/console > /dev/console 2>&1
+    /bin/busybox sleep 2
+done

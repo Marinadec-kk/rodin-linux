@@ -1,0 +1,353 @@
+#!/bin/sh
+# Research PID 1, local USB-only unauthenticated shell. Never mount phone storage.
+export PATH=/bin:/sbin
+export HOME=/root
+export TERM=vt100
+umask 077
+
+# Refuse to run this mount/configfs script in an ordinary host/Android shell.
+if [ "$$" -ne 1 ]; then
+    echo "rodin usb-init must be PID 1 in the experimental initramfs" >&2
+    exit 1
+fi
+
+bb() { /bin/busybox "$@"; }
+fatal() {
+    echo "rodin-bringup: fatal: $*" > /dev/console
+    while :; do bb sleep 10; done
+}
+log() {
+    echo "rodin-bringup: $*"
+    echo "rodin-bringup: $*" >> /run/rodin-bringup.log
+    if [ -c /dev/kmsg ]; then echo "<6>rodin-bringup: $*" > /dev/kmsg; fi
+}
+
+# Expose BusyBox applet names inside this writable initramfs, not on phone storage.
+bb --install -s /bin || fatal "BusyBox applet installation"
+
+# proc/sysfs are needed before deriving dynamic tty device numbers.
+bb mount -t proc proc /proc || fatal "proc mount"
+bb mount -t sysfs sysfs /sys || fatal "sysfs mount"
+# Keep every progress line: the pstore console is the only log channel after a reset.
+echo on > /proc/sys/kernel/printk_devkmsg 2>/dev/null
+bb mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run || fatal "run mount"
+bb mount -t devpts -o mode=0620,gid=5 devpts /dev/pts || fatal "devpts mount"
+log "USB ACM candidate; no Android init, no storage mounts"
+
+early_watchdog() {
+    # The bootloader arms the hardware watchdog; load its driver first and feed it
+    # from userspace, then load reboot-mode so the deadline can reach fastboot.
+    bb head -n 3 /etc/rodin/modules.sha256 | bb sha256sum -c >> /run/rodin-bringup.log 2>&1 || {
+        log "early module integrity check failed"; return 1; }
+    for module in /lib/modules/mtk_wdt.ko /lib/modules/reboot-mode.ko /lib/modules/syscon-reboot-mode.ko; do
+        if bb insmod "$module" >> /run/rodin-bringup.log 2>&1; then
+            log "early inserted $module"
+        else
+            log "early insert failed: $module"
+        fi
+    done
+    count=0
+    while [ ! -r /sys/class/watchdog/watchdog0/dev ] && [ "$count" -lt 5 ]; do
+        bb sleep 1
+        count=$((count + 1))
+    done
+    [ -r /sys/class/watchdog/watchdog0/dev ] || { log "no watchdog0 registered"; return 1; }
+    IFS=: read -r major minor < /sys/class/watchdog/watchdog0/dev
+    case "$major:$minor" in *[!0-9:]*|:*|*:|*:*:*) return 1 ;; esac
+    bb mknod -m 600 /dev/watchdog0 c "$major" "$minor" || return 1
+    bb watchdog -T 60 -t 5 /dev/watchdog0 && log "feeding watchdog0 every 5 s"
+}
+early_watchdog || log "early watchdog setup incomplete"
+
+# Without a console the only recovery is a warm reboot to fastboot, which also
+# keeps the ramoops console for the next Android boot to report.
+(
+    bb sleep 120
+    state=
+    for path in /sys/class/udc/*/state; do [ -r "$path" ] && IFS= read -r state < "$path"; done
+    if [ "$state" != configured ]; then
+        log "deadline: UDC state '${state:-none}' after 120 s; rebooting to bootloader"
+        bb sync
+        /bin/reboot-bootloader
+    fi
+    log "deadline: UDC configured; staying up"
+) &
+deadline_pid=$!
+
+module_args() {
+    # Like Android's libmodprobe/kmod: pass "<module>.<param>=<value>" words from
+    # the kernel command line (e.g. hwid.project_name) to insmod; '-' == '_'.
+    wanted=$(echo "$1" | bb tr - _)
+    for word in $(bb cat /proc/cmdline); do
+        case "$word" in
+            *.*=*) ;;
+            *) continue ;;
+        esac
+        key=$(echo "${word%%.*}" | bb tr - _)
+        [ "$key" = "$wanted" ] && printf ' %s' "${word#*.}"
+    done
+}
+
+load_modules() {
+    # Reject wrong ramdisk/module combinations before any module insertion.
+    if [ ! -f /etc/rodin/modules.load ] || [ ! -r /etc/rodin/modules.load ] || [ ! -s /etc/rodin/modules.load ]; then
+        log "module load plan missing, unreadable or empty; USB setup aborted"
+        return 1
+    fi
+    if ! bb sha256sum -c /etc/rodin/modules.sha256 >> /run/rodin-bringup.log 2>&1; then
+        log "module integrity check failed; USB setup aborted"
+        return 1
+    fi
+    failures=0
+    malformed=0
+    stop_after=
+    [ -r /etc/rodin/stop-after ] && read -r stop_after < /etc/rodin/stop-after
+    # "early" stops after the USB-ready prefix, "late" loads only the remainder.
+    mode=${1:-all}
+    phase_end=
+    [ -r /etc/rodin/usb-phase ] && read -r phase_end < /etc/rodin/usb-phase
+    loaded=0
+    while read -r module name; do
+        if [ -n "$phase_end" ]; then
+            case "$mode" in
+                early) [ "$loaded" -ge "$phase_end" ] && break ;;
+                late) if [ "$loaded" -lt "$phase_end" ]; then loaded=$((loaded + 1)); continue; fi ;;
+            esac
+        fi
+        if [ -n "$stop_after" ] && [ "$loaded" -ge "$stop_after" ]; then
+            # Hold 40 s so a delayed (timer/probe) failure still shows up as a reset.
+            log "bisection: stopping after $loaded modules; holding 40 s"
+            bb sleep 40
+            log "bisection: survived; rebooting to bootloader"
+            bb sync
+            /bin/reboot-bootloader
+        fi
+        loaded=$((loaded + 1))
+        if [ -z "$name" ]; then
+            log "module load entry has no name; USB setup aborted"
+            malformed=$((malformed + 1))
+            continue
+        fi
+        if [ -d "/sys/module/$name" ]; then continue; fi
+        args=$(module_args "$name")
+        # Word splitting of $args is intended: one cmdline word per parameter.
+        if bb insmod "$module" $args >> /run/rodin-bringup.log 2>&1; then
+            log "inserted $name${args:+ with$args}"
+        else
+            log "failed to insert $name"
+            failures=$((failures + 1))
+        fi
+    done < /etc/rodin/modules.load
+    [ "$malformed" -eq 0 ] || return 1
+    # Best effort like a first stage: a failed optional driver must not block USB.
+    [ "$failures" -eq 0 ] || log "$failures module(s) failed to insert; continuing"
+}
+
+set_device_role() {
+    udc_device=$(CDPATH= cd -P "/sys/class/udc/$udc/device" && pwd -P) || {
+        log "cannot resolve parent device for UDC $udc"; return 1;
+    }
+    # mtu3 registers the UDC before its role switch; match parents, not names.
+    count=0
+    role_path=
+    while :; do
+        found=0
+        for path in /sys/class/usb_role/*; do
+            [ -d "$path" ] || continue
+            role_device=$(CDPATH= cd -P "$path/device" && pwd -P) || continue
+            [ "$role_device" = "$udc_device" ] || continue
+            role_path=$path/role
+            found=$((found + 1))
+        done
+        if [ "$found" -eq 1 ]; then break; fi
+        if [ "$found" -gt 1 ]; then log "ambiguous USB role switch for $udc"; return 1; fi
+        [ "$count" -lt 30 ] || { log "no USB role switch for $udc after 30 seconds"; return 1; }
+        bb sleep 1
+        count=$((count + 1))
+    done
+    [ -r "$role_path" ] && [ -w "$role_path" ] || {
+        log "USB role attribute unavailable: $role_path"; return 1;
+    }
+    log "requesting device role for $udc via $role_path"
+    echo device > "$role_path" || { log "USB role write failed: $role_path"; return 1; }
+    # mtu3 queues the change; readback is driver state, not proof of enumeration.
+    count=0
+    while :; do
+        IFS= read -r role < "$role_path" || { log "USB role read failed: $role_path"; return 1; }
+        case "$role" in
+            device) log "USB role readback: device ($udc)"; return 0 ;;
+            host|none) ;;
+            *) log "unexpected USB role readback: $role"; return 1 ;;
+        esac
+        [ "$count" -lt 10 ] || { log "USB device role timed out: $role ($udc)"; return 1; }
+        bb sleep 1
+        count=$((count + 1))
+    done
+}
+
+usb_console() {
+    bb mkdir -p /run/configfs
+    bb mount -t configfs -o nosuid,nodev,noexec configfs /run/configfs || return 1
+
+    # Wait for driver probing; never assume the Android property is still valid.
+    count=0
+    udc=
+    while [ "$count" -lt 30 ]; do
+        found=0
+        for path in /sys/class/udc/*; do
+            [ -e "$path" ] || continue
+            udc=${path##*/}
+            found=$((found + 1))
+        done
+        if [ "$found" -eq 1 ]; then break; fi
+        if [ "$found" -gt 1 ]; then log "ambiguous UDC selection"; return 1; fi
+        bb sleep 1
+        count=$((count + 1))
+    done
+    [ -n "$udc" ] || { log "no UDC after 30 seconds"; return 1; }
+
+    gadget=/run/configfs/usb_gadget/rodin
+    # Conventional Linux diagnostic gadget IDs, not product IDs for shipping.
+    bb mkdir "$gadget" || return 1
+    echo 0x1d6b > "$gadget/idVendor" || return 1
+    echo 0x0104 > "$gadget/idProduct" || return 1
+    echo 0x0200 > "$gadget/bcdUSB" || return 1
+    echo 0x0001 > "$gadget/bcdDevice" || return 1
+    bb mkdir -p "$gadget/strings/0x409" || return 1
+    echo rodin-bringup > "$gadget/strings/0x409/serialnumber" || return 1
+    echo Linux-research > "$gadget/strings/0x409/manufacturer" || return 1
+    echo Rodin-ACM-console > "$gadget/strings/0x409/product" || return 1
+    bb mkdir -p "$gadget/functions/acm.usb0" "$gadget/configs/c.1/strings/0x409" || return 1
+    echo console > "$gadget/configs/c.1/strings/0x409/configuration" || return 1
+    # MaxPower is mA in configfs. No PD negotiation or charger sysfs writes.
+    echo 100 > "$gadget/configs/c.1/MaxPower" || return 1
+    bb ln -s "$gadget/functions/acm.usb0" "$gadget/configs/c.1/acm.usb0" || return 1
+    # USB networking (usb0 on the phone) for SSH; the console must not depend on it.
+    if bb mkdir "$gadget/functions/ncm.usb0" && bb ln -s "$gadget/functions/ncm.usb0" "$gadget/configs/c.1/ncm.usb0"; then
+        log "NCM function added"
+    else
+        log "NCM function unavailable; ACM only"
+    fi
+    set_device_role || return 1
+    echo "$udc" > "$gadget/UDC" || return 1
+    log "ACM bound to $udc"
+    : > /run/rodin-usb-bound
+
+    count=0
+    while [ ! -r /sys/class/tty/ttyGS0/dev ] && [ "$count" -lt 10 ]; do
+        bb sleep 1
+        count=$((count + 1))
+    done
+    [ -r /sys/class/tty/ttyGS0/dev ] || return 1
+    IFS=: read -r major minor < /sys/class/tty/ttyGS0/dev
+    # Kernel-provided numbers only; do not guess a ttyGS major/minor.
+    case "$major:$minor" in *[!0-9:]*|:*|*:|*:*:*) return 1 ;; esac
+    bb mknod -m 600 /dev/ttyGS0 c "$major" "$minor" || return 1
+    log "ttyGS0 ready; shell has no password (local research only)"
+    (
+        while :; do
+            bb setsid /bin/busybox getty -L -n -l /bin/sh 115200 ttyGS0 vt100
+            log "USB shell ended; restarting getty"
+            bb sleep 1
+        done
+    ) &
+    getty_pid=$!
+}
+
+switch_to_rootfs() {
+    # Hand over to the Linux system on userdata (ext4, /sbin/init). Any problem
+    # leaves this stage-1 shell running; `touch /run/rodin-stay` within 10 s too.
+    count=0
+    dev=
+    while [ -z "$dev" ] && [ "$count" -lt 20 ]; do
+        for uevent in /sys/class/block/*/uevent; do
+            bb grep -qx PARTNAME=userdata "$uevent" 2>/dev/null || continue
+            dev=${uevent%/uevent}
+        done
+        [ -n "$dev" ] || { bb sleep 1; count=$((count + 1)); }
+    done
+    [ -n "$dev" ] || { log "rootfs: userdata partition not found; staying in stage 1"; return 1; }
+    IFS=: read -r major minor < "$dev/dev"
+    case "$major:$minor" in *[!0-9:]*|:*|*:|*:*:*) return 1 ;; esac
+    bb mknod -m 600 /dev/userdata b "$major" "$minor" 2>/dev/null || [ -b /dev/userdata ] || return 1
+    bb mkdir -p /newroot
+    if ! bb mount -t ext4 -o noatime /dev/userdata /newroot 2>> /run/rodin-bringup.log; then
+        log "rootfs: userdata is not a mountable ext4 filesystem; staying in stage 1"
+        return 1
+    fi
+    if [ ! -x /newroot/sbin/init ] || [ -e /newroot/etc/rodin/stage1-only ]; then
+        log "rootfs: no /sbin/init or stage1-only flag; staying in stage 1 (mounted at /newroot)"
+        return 1
+    fi
+    log "rootfs: switching to userdata in 10 s (touch /run/rodin-stay to abort)"
+    bb sleep 10
+    if [ -e /run/rodin-stay ]; then
+        log "rootfs: switch aborted by /run/rodin-stay (mounted at /newroot)"
+        return 1
+    fi
+    # The new init owns ttyGS0 and USB networking; the watchdog feeder keeps running.
+    [ -n "${deadline_pid:-}" ] && kill "$deadline_pid" 2>/dev/null
+    [ -n "${getty_pid:-}" ] && kill "$getty_pid" 2>/dev/null
+    # getty execs the shell, so match by controlling terminal rather than by name.
+    for proc in /proc/[0-9]*; do
+        pid=${proc#/proc/}
+        [ "$pid" = 1 ] && continue
+        # Interactive ash ignores SIGTERM.
+        [ "$(bb readlink "$proc/fd/0" 2>/dev/null)" = /dev/ttyGS0 ] && kill -9 "$pid" 2>/dev/null
+    done
+    bb cp /run/rodin-bringup.log /newroot/var/log/rodin-stage1.log 2>/dev/null
+    for mount in /dev/pts /proc /sys /run; do
+        bb mkdir -p "/newroot$mount"
+    done
+    # No devtmpfs: hand the new root a populated tmpfs /dev, as devtmpfs would.
+    # Its own mdev fills in the rest; init and OpenRC need console/null before that.
+    if bb mount -t tmpfs -o mode=0755,size=10M,nosuid tmpfs /newroot/dev; then
+        for node in console:5:1:600 null:1:3:666 zero:1:5:666 tty:5:0:666 kmsg:1:11:644 \
+                    random:1:8:666 urandom:1:9:666; do
+            IFS=: read -r name major minor mode <<EOF_NODE
+$node
+EOF_NODE
+            bb mknod -m "$mode" "/newroot/dev/$name" c "$major" "$minor"
+        done
+        for class in tty/ttyGS0 watchdog/watchdog0; do
+            [ -r "/sys/class/$class/dev" ] || continue
+            IFS=: read -r major minor < "/sys/class/$class/dev"
+            bb mknod -m 600 "/newroot/dev/${class#*/}" c "$major" "$minor"
+        done
+        bb mkdir -p /newroot/dev/pts /newroot/dev/shm
+    else
+        log "rootfs: cannot mount tmpfs on /newroot/dev"
+    fi
+    bb umount /dev/pts 2>/dev/null
+    bb mount --move /sys /newroot/sys
+    bb mount --move /proc /newroot/proc
+    bb mount --move /run /newroot/run
+    log "rootfs: exec switch_root"
+    # exec cannot run shell functions such as bb(); a failed exec would kill PID 1.
+    exec /bin/busybox switch_root /newroot /sbin/init
+}
+
+if load_modules early; then
+    if usb_console; then
+        # Remaining drivers load behind a live shell so a late failure is observable.
+        if [ -e /etc/rodin/load-late ]; then
+            log "USB console up; loading remaining modules"
+            load_modules late
+            log "late module loading finished"
+        else
+            log "USB console up; late modules left unloaded (see /etc/rodin/modules.load)"
+        fi
+        switch_to_rootfs
+        while :; do bb sleep 3600; done
+    fi
+    log "USB console initialization failed"
+else
+    log "module insertion failed; USB setup skipped"
+fi
+
+# Keep PID 1 alive. A kernel console may be inaccessible on this hardware.
+log "falling back to /dev/console; USB is not demonstrated"
+while :; do
+    bb setsid /bin/busybox getty -L -n -l /bin/sh 0 console vt100
+    bb sleep 2
+done
