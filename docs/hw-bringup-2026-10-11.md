@@ -45,7 +45,24 @@ observable until thermal drivers from vendor_dlkm are loaded.
   partitions.
 - The host's ModemManager probes the ACM port for ~30 s after each enumeration.
 
+## Recheck 2026-10-31
+
+- After ~20 days unplugged the battery was at 1 %; Linux boot-looped on USB power
+  (boot load exceeds the ~340 mA a PC port delivers). Recovered by charging in LK
+  fastboot (`off-mode-charge: 1`); at 4 % Linux then booted and stayed up.
+- Battery `current_now` is negative while charging (voltage rises; the charger log
+  `CHARGE_LOOP BMS = [.. 3651 -437 ..]` reports the same sign).
+- Load average ~15 at idle comes from D-state kernel threads (`wdtk-*`,
+  `mitee_worker/*`); CPU is ~96 % idle. It is not a real load.
+- Touch coordinate mode: on boot the panel-on hook's `enable_touch_raw=0` succeeded
+  (`goodix_htc_enable_touch_coord: success send touch data cmd 1`).
+- Power-key wake **failed for the user**: the kernel logged UNBLANK, the Goodix
+  resume and the hook's `enable_touch_raw 0` at +2 s, but the user saw no picture and
+  a second press 4 s later blanked again. During those 4 s, `cat /dev/input/event2`
+  (goodix_ts) captured 0 bytes. The 2026-10-11 backlight fix is therefore not reliable;
+  touch input is still unconfirmed.
+
 ## Not verified
 
-Rootfs switch (`switch_to_rootfs` has not run against an ext4 userdata), SSH, Wi-Fi,
-display, audio, modem, thermal sensors and throttling, suspend, long-run stability.
+Touch input events from a finger, reliable wake from blank, Wi-Fi association,
+audio, modem, camera, suspend, long-run stability.
