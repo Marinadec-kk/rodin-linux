@@ -342,11 +342,9 @@ PANEL_HOOK = r'''#!/bin/sh
 led=/sys/class/leds/lcd-backlight/brightness
 start_us=$(awk '{printf "%d", $1 * 1000000}' /proc/uptime)
 restore_backlight() {
-    level=$(cat "$led" 2>/dev/null)
-    case "$level" in ''|*[!0-9]*|0) level=3000 ;; esac
     # Writing the unchanged value is ignored by the driver; force a real update.
-    echo $((level - 1)) > "$led"
-    echo "$level" > "$led"
+    echo $(($1 - 1)) > "$led"
+    echo "$1" > "$led"
 }
 # /dev/kmsg returns whole records only (a 1-byte read, as ash's `read` does,
 # fails with EINVAL), so let cat read it; reopen if it ever exits (EPIPE).
@@ -360,9 +358,11 @@ cat /dev/kmsg | while IFS= read -r line; do
     case "$stamp" in ''|*[!0-9]*) continue ;; esac
     [ "$stamp" -ge "$start_us" ] || continue
     # The panel ignores brightness until its first frames are out; retry.
+    level=$(cat "$led" 2>/dev/null)
+    case "$level" in ''|*[!0-9]*|0) level=3000 ;; esac
     for delay in 0.3 0.7 1; do
         sleep "$delay"
-        restore_backlight
+        restore_backlight "$level"
     done
     [ -x /etc/rodin/panel-on.d/touch ] && /etc/rodin/panel-on.d/touch
 done
@@ -375,6 +375,21 @@ command=/usr/local/sbin/rodin-panel-hook
 command_background=yes
 pidfile=/run/rodin-panel-hook.pid
 depend() { need dev; before greetd; }
+'''
+# EXPERIMENTAL: not yet confirmed by a human touching the screen.
+PANEL_ON_TOUCH = r'''#!/bin/sh
+# Run by rodin-panel-hook after each panel power-on (the IC has just been reset
+# and the late-init THP flag routes frames to Android's THP daemon). "0" makes
+# goodix_htc_enable(0) clear the driver's THP flag and switch the IC to
+# coordinate reports, so touches reach /dev/input as a normal MT device.
+node=/sys/class/touch/touch_dev/enable_touch_raw
+[ -w "$node" ] || exit 0
+for attempt in 1 2 3; do
+    echo 0 > "$node" && exit 0
+    sleep 0.5
+done
+logger -t rodin-touch "could not switch touch to coordinate mode"
+exit 1
 '''
 FILES = {
     '/etc/inittab': INITTAB,
@@ -432,6 +447,7 @@ SCRIPTS = {
     '/etc/init.d/rodin-touch': TOUCH,
     '/usr/local/sbin/rodin-panel-hook': PANEL_HOOK,
     '/etc/init.d/rodin-panel-hook': PANEL_HOOK_INIT,
+    '/etc/rodin/panel-on.d/touch': PANEL_ON_TOUCH,
     '/usr/local/bin/rodin-phosh-session': PHOSH_SESSION,
     '/usr/local/sbin/rodin-thermald': THERMALD,
     '/etc/rodin/wifi-poweron.sh': WIFI_POWERON,
